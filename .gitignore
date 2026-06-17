@@ -1,0 +1,7 @@
+# deps & build artifacts
+node_modules/
+duduclaw-fork/crates/
+duduclaw-fork/web/dist/
+**/tsconfig.tsbuildinfo
+*.log
+.DS_Store

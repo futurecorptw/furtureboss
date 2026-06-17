@@ -1,0 +1,381 @@
+import { useEffect, useState, useCallback } from 'react';
+import { useIntl } from 'react-intl';
+import { cn } from '@/lib/utils';
+import { api, type AccountInfo, type BudgetSummary } from '@/lib/api';
+import { toast, formatError } from '@/lib/toast';
+import { Dialog, FormField, inputClass, selectClass, buttonPrimary, buttonSecondary } from '@/components/shared/Dialog';
+import {
+  Wallet,
+  Plus,
+  RefreshCw,
+  CheckCircle,
+  AlertTriangle,
+  Key,
+  KeyRound,
+  Pencil,
+} from 'lucide-react';
+
+export function AccountsPage() {
+  const intl = useIntl();
+  const [budget, setBudget] = useState<BudgetSummary | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [showAddDialog, setShowAddDialog] = useState(false);
+
+  const fetchBudget = useCallback(async () => {
+    setLoading(true);
+    try {
+      const result = await api.accounts.budgetSummary();
+      setBudget(result);
+    } catch (e) {
+      toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
+    } finally {
+      setLoading(false);
+    }
+  }, [intl]);
+
+  useEffect(() => {
+    fetchBudget();
+  }, [fetchBudget]);
+
+  const handleRotate = async () => {
+    try {
+      await api.accounts.rotate();
+      await fetchBudget();
+    } catch (e) {
+      toast.error(intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: formatError(e) }));
+    }
+  };
+
+  const totalBudget = budget?.total_budget_cents ?? 0;
+  const totalSpent = budget?.total_spent_cents ?? 0;
+  const usagePercent =
+    totalBudget > 0 ? Math.min(100, (totalSpent / totalBudget) * 100) : 0;
+
+  return (
+    <div className="space-y-6">
+      <div className="flex items-center justify-between">
+        <h2 className="text-2xl font-semibold text-stone-900 dark:text-stone-50">
+          {intl.formatMessage({ id: 'accounts.title' })}
+        </h2>
+        <div className="flex gap-2">
+          <button
+            onClick={handleRotate}
+            className="inline-flex items-center gap-2 rounded-lg border border-stone-200 bg-white px-4 py-2 text-sm font-medium text-stone-700 transition-colors hover:bg-stone-50 dark:border-stone-700 dark:bg-stone-800 dark:text-stone-300 dark:hover:bg-stone-700"
+          >
+            <RefreshCw className="h-4 w-4" />
+            {intl.formatMessage({ id: 'accounts.rotate' })}
+          </button>
+          <button
+            onClick={() => setShowAddDialog(true)}
+            className="inline-flex items-center gap-2 rounded-lg bg-amber-500 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-amber-600"
+          >
+            <Plus className="h-4 w-4" />
+            {intl.formatMessage({ id: 'accounts.add' })}
+          </button>
+        </div>
+      </div>
+
+      {/* Budget Summary */}
+      <div className="glass-card rounded-2xl p-6">
+        <div className="flex items-center gap-3 mb-4">
+          <div className="rounded-lg bg-amber-100 p-2.5 dark:bg-amber-900/30">
+            <Wallet className="h-5 w-5 text-amber-600 dark:text-amber-400" />
+          </div>
+          <div>
+            <h3 className="text-lg font-medium text-stone-900 dark:text-stone-50">
+              {intl.formatMessage({ id: 'accounts.budget.total' })}
+            </h3>
+          </div>
+        </div>
+
+        <div className="mb-2 flex justify-between text-sm">
+          <span className="text-stone-500 dark:text-stone-400">
+            {intl.formatMessage({ id: 'accounts.budget.used' })}:{' '}
+            <span className="font-semibold text-stone-900 dark:text-stone-50">
+              ${(totalSpent / 100).toFixed(2)}
+            </span>
+          </span>
+          <span className="text-stone-500 dark:text-stone-400">
+            {intl.formatMessage({ id: 'accounts.budget.remaining' })}:{' '}
+            <span className="font-semibold text-stone-900 dark:text-stone-50">
+              ${((totalBudget - totalSpent) / 100).toFixed(2)}
+            </span>
+          </span>
+        </div>
+
+        <div className="h-3 overflow-hidden rounded-full bg-stone-200 dark:bg-stone-700">
+          <div
+            className={cn(
+              'h-full rounded-full transition-all',
+              usagePercent > 80
+                ? 'bg-rose-500'
+                : usagePercent > 60
+                  ? 'bg-amber-500'
+                  : 'bg-emerald-500'
+            )}
+            style={{ width: `${usagePercent}%` }}
+          />
+        </div>
+
+        <p className="mt-2 text-right text-xs text-stone-400 dark:text-stone-500">
+          ${(totalBudget / 100).toFixed(2)}{' '}
+          {intl.formatMessage({ id: 'accounts.budget.total' })}
+        </p>
+      </div>
+
+      {/* Accounts List */}
+      {!loading && budget?.accounts && budget.accounts.length > 0 ? (
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          {budget.accounts.map((account) => (
+            <AccountCard key={account.id} account={account} intl={intl} onBudgetUpdated={fetchBudget} />
+          ))}
+        </div>
+      ) : !loading ? (
+        <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-stone-300 bg-white py-16 dark:border-stone-700 dark:bg-stone-900">
+          <Wallet className="mb-4 h-12 w-12 text-stone-300 dark:text-stone-600" />
+          <p className="text-stone-500 dark:text-stone-400">
+            {intl.formatMessage({ id: 'common.noData' })}
+          </p>
+        </div>
+      ) : null}
+
+      {/* Add Account Dialog */}
+      <AddAccountDialog
+        open={showAddDialog}
+        onClose={() => setShowAddDialog(false)}
+        onCreated={fetchBudget}
+      />
+    </div>
+  );
+}
+
+function AddAccountDialog({
+  open,
+  onClose,
+  onCreated,
+}: {
+  open: boolean;
+  onClose: () => void;
+  onCreated: () => void;
+}) {
+  const intl = useIntl();
+  const [name, setName] = useState('');
+  const [accountType, setAccountType] = useState('api_key');
+  const [apiKey, setApiKey] = useState('');
+  const [budget, setBudget] = useState('50');
+  const [priority, setPriority] = useState('1');
+  const [submitting, setSubmitting] = useState(false);
+
+  const [error, setError] = useState<string | null>(null);
+
+  const handleSubmit = async () => {
+    if (!name.trim()) return;
+    if (!apiKey.trim()) {
+      setError(intl.formatMessage({ id: 'accounts.provider.keyRequired' }));
+      return;
+    }
+    setSubmitting(true);
+    setError(null);
+    try {
+      await api.accounts.add({
+        id: name.trim(),
+        type: accountType,
+        key: apiKey.trim(),
+        monthly_budget_cents: Math.round(Number(budget) * 100),
+        priority: Number(priority),
+      });
+      onCreated();
+      onClose();
+      setName('');
+      setApiKey('');
+      setBudget('50');
+      setPriority('1');
+    } catch {
+      setError(intl.formatMessage({ id: 'accounts.provider.addFailed' }));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <Dialog open={open} onClose={onClose} title={intl.formatMessage({ id: 'accounts.add' })}>
+      <div className="space-y-4">
+        <FormField label={intl.formatMessage({ id: 'accounts.provider.name' })}>
+          <input
+            type="text"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder={intl.formatMessage({ id: 'accounts.name.placeholder' })}
+            className={inputClass}
+          />
+        </FormField>
+
+        <FormField label={intl.formatMessage({ id: 'accounts.provider.authMethod' })}>
+          <select
+            value={accountType}
+            onChange={(e) => setAccountType(e.target.value)}
+            className={selectClass}
+          >
+            <option value="api_key">API Key</option>
+            <option value="oauth">OAuth Token</option>
+          </select>
+        </FormField>
+
+        <FormField label={accountType === 'api_key' ? 'API Key' : 'OAuth Token'}>
+          <input
+            type="password"
+            value={apiKey}
+            onChange={(e) => setApiKey(e.target.value)}
+            placeholder={accountType === 'api_key' ? 'sk-ant-...' : 'oauth-token-...'}
+            className={inputClass}
+          />
+        </FormField>
+
+        <div className="grid grid-cols-2 gap-4">
+          <FormField label={intl.formatMessage({ id: 'accounts.provider.budget' })}>
+            <input
+              type="number"
+              value={budget}
+              onChange={(e) => setBudget(e.target.value)}
+              min="1"
+              className={inputClass}
+            />
+          </FormField>
+          <FormField label={intl.formatMessage({ id: 'accounts.provider.priority' })} hint={intl.formatMessage({ id: 'accounts.provider.priorityHint' })}>
+            <input
+              type="number"
+              value={priority}
+              onChange={(e) => setPriority(e.target.value)}
+              min="1"
+              max="10"
+              className={inputClass}
+            />
+          </FormField>
+        </div>
+
+        {error && (
+          <p className="text-sm text-rose-600 dark:text-rose-400">{error}</p>
+        )}
+
+        <div className="flex justify-end gap-3 pt-2">
+          <button onClick={onClose} className={buttonSecondary}>
+            {intl.formatMessage({ id: 'common.cancel' })}
+          </button>
+          <button onClick={handleSubmit} disabled={submitting || !name.trim()} className={buttonPrimary}>
+            {submitting ? intl.formatMessage({ id: 'common.loading' }) : intl.formatMessage({ id: 'accounts.add' })}
+          </button>
+        </div>
+      </div>
+    </Dialog>
+  );
+}
+
+function AccountCard({
+  account,
+  intl,
+  onBudgetUpdated,
+}: {
+  account: AccountInfo;
+  intl: ReturnType<typeof useIntl>;
+  onBudgetUpdated: () => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [budgetInput, setBudgetInput] = useState(String(account.monthly_budget_cents / 100));
+  const [saving, setSaving] = useState(false);
+
+  const spentPercent =
+    account.monthly_budget_cents > 0
+      ? Math.min(100, (account.spent_this_month / account.monthly_budget_cents) * 100)
+      : 0;
+
+  const handleSaveBudget = async () => {
+    setSaving(true);
+    try {
+      await api.accounts.updateBudget(account.id, Math.round(Number(budgetInput) * 100));
+      setEditing(false);
+      onBudgetUpdated();
+    } catch (e) {
+      toast.error(intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: formatError(e) }));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="glass-card glass-card-hover rounded-2xl p-5">
+      <div className="flex items-start justify-between">
+        <div className="flex items-center gap-3">
+          <div className="rounded-lg bg-stone-100 p-2 dark:bg-stone-800">
+            {(account.auth_method ?? 'unknown') === 'apikey' ? (
+              <Key className="h-4 w-4 text-stone-600 dark:text-stone-400" />
+            ) : (
+              <KeyRound className="h-4 w-4 text-stone-600 dark:text-stone-400" />
+            )}
+          </div>
+          <div>
+            <h3 className="font-semibold text-stone-900 dark:text-stone-50">{account.id}</h3>
+            <p className="text-xs capitalize text-stone-500 dark:text-stone-400">
+              {(account.auth_method ?? account.account_type ?? 'unknown').replace('_', ' ')}
+            </p>
+          </div>
+        </div>
+        {account.is_healthy ? (
+          <CheckCircle className="h-5 w-5 text-emerald-500" />
+        ) : (
+          <AlertTriangle className="h-5 w-5 text-amber-500" />
+        )}
+      </div>
+
+      <div className="mt-3 flex items-center gap-2 text-xs text-stone-500 dark:text-stone-400">
+        <span>
+          {intl.formatMessage({ id: 'accounts.priority' })}: <strong>{account.priority}</strong>
+        </span>
+      </div>
+
+      <div className="mt-4">
+        <div className="mb-1 flex items-center justify-between text-xs text-stone-500 dark:text-stone-400">
+          <span>{intl.formatMessage({ id: 'accounts.budget.used' })}</span>
+          {editing ? (
+            <div className="flex items-center gap-1">
+              <span>${(account.spent_this_month / 100).toFixed(2)} / $</span>
+              <input
+                type="number"
+                min="1"
+                value={budgetInput}
+                onChange={(e) => setBudgetInput(e.target.value)}
+                className="w-20 rounded border border-amber-400 bg-white px-1.5 py-0.5 text-xs text-stone-900 focus:outline-none dark:border-amber-600 dark:bg-stone-800 dark:text-stone-50"
+                autoFocus
+              />
+              <button onClick={handleSaveBudget} disabled={saving} className="rounded bg-amber-500 px-1.5 py-0.5 text-xs text-white hover:bg-amber-600 disabled:opacity-50">
+                {intl.formatMessage({ id: 'common.save' })}
+              </button>
+              <button onClick={() => setEditing(false)} className="text-xs text-stone-400 hover:text-stone-600">
+                {intl.formatMessage({ id: 'common.cancel' })}
+              </button>
+            </div>
+          ) : (
+            <button
+              onClick={() => { setBudgetInput(String(account.monthly_budget_cents / 100)); setEditing(true); }}
+              className="flex items-center gap-1 hover:text-amber-600 dark:hover:text-amber-400"
+            >
+              <span>
+                ${(account.spent_this_month / 100).toFixed(2)} / $
+                {(account.monthly_budget_cents / 100).toFixed(2)}
+              </span>
+              <Pencil className="h-3 w-3" />
+            </button>
+          )}
+        </div>
+        <div className="h-1.5 overflow-hidden rounded-full bg-stone-200 dark:bg-stone-700">
+          <div
+            className={cn(
+              'h-full rounded-full transition-all',
+              spentPercent > 80 ? 'bg-rose-500' : 'bg-amber-500'
+            )}
+            style={{ width: `${spentPercent}%` }}
+          />
+        </div>
+      </div>
+    </div>
+  );
+}

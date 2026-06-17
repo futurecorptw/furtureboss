@@ -1,0 +1,225 @@
+/* ===========================================================================
+   DuDuClaw Dashboard — genspark 風格 skin
+   注入方式：proxy.js 於 HTML </head> 前插入此檔內容（晚於 bundle CSS，優先生效）
+   設計依據：https://www.genspark.ai/zh-tw（近白暖灰、中性黑、白色實面、大圓角、留白）
+
+   原 dashboard 為 glassmorphism + 琥珀色(amber)品牌色。
+   策略：覆寫 Tailwind v4 色票與主題變數，把 amber→中性黑、毛玻璃→白色實面。
+   CSP 僅允許 inline CSS（不可注入 JS），全部以 CSS 達成。
+   =========================================================================== */
+
+/* ---- 0. 隱藏側欄多用戶項目（單人系統外觀） ---- */
+aside a[href="/users"],        /* 使用者管理 */
+aside a[href="/accounts"],     /* 帳號與預算 */
+aside a[href="/partner"],      /* 合作夥伴入口 */
+aside a[href="/org"],          /* 組織架構 */
+aside a[href="/shared-wiki"],  /* 共享知識庫 */
+aside a[href="/billing"],      /* 帳務 Billing */
+aside a[href="/license"],      /* 授權 License */
+aside a[href="/logs"],         /* 審計日誌 */
+aside a[href="/mcp"],          /* MCP 工具 */
+aside a[href="/security"],     /* 安全設定 */
+aside a[href="/wiki-trust"],   /* Wiki Trust */
+aside a[href="/skills"],       /* Skill 市場 */
+aside a[href="/tasks"],        /* 任務看板 */
+aside a[href="/odoo"],         /* Odoo ERP */
+aside a[href="/agents"] {      /* Agent 設定（改用 Boss 設定 進入） */
+  display: none !important;
+}
+
+/* ---- 0b. 側欄排序（用明確 order 排定全部可見項目） ---- */
+aside nav { display: flex !important; flex-direction: column !important; }
+aside nav a[href="/"]            { order: 1 !important; }  /* 首頁 */
+aside nav a[href="/webchat"]     { order: 2 !important; }  /* 即時對話 */
+aside nav a[href="/cron"]        { order: 3 !important; }  /* 排程任務 */
+aside nav a[href="/reports"]     { order: 4 !important; }  /* 分析報表 */
+aside nav a[href="/memory"]      { order: 5 !important; }  /* 記憶與技能 */
+aside nav a[href="/wiki"]        { order: 6 !important; }  /* 知識庫 */
+aside nav a[href="/marketplace"] { order: 7 !important; }  /* 應用市集 */
+aside nav a[href="/agents"]      { order: 8 !important; }  /* Agent 設定（已隱藏） */
+aside nav a[href="/boss"]        { order: 9 !important; }  /* Boss 設定 */
+aside nav a[href="/channels"]    { order: 10 !important; } /* 通道管理 */
+aside nav a[href="/settings"]    { order: 11 !important; } /* 系統設定 */
+
+/* ---- 1. 主題變數覆寫（未分 layer，優先於 bundle 的 @layer/:root） ---- */
+:root {
+  /* 主畫面：近白（比選單更淺） */
+  --app-bg: #FDFDFC !important;
+
+  /* 毛玻璃 → genspark 式白色實面卡片 + 柔和中性陰影 */
+  --glass-fill: #FFFFFF !important;
+  --glass-fill-strong: #FFFFFF !important;
+  --glass-border: #ECEAE6 !important;
+  --glass-edge: inset 0 1px 0 0 rgba(255, 255, 255, 0.9) !important;
+  --glass-shadow: 0 8px 24px -14px rgba(23, 23, 23, 0.10) !important;
+  --glass-shadow-hover: 0 16px 40px -16px rgba(23, 23, 23, 0.14) !important;
+
+  /* 淡化背景網格，換取 genspark 的乾淨留白 */
+  --grid-line: transparent !important;
+
+  /* 把品牌 amber 色票改為中性黑/灰：
+     - 淺階(50~200)→ 近白淺灰（用於底色/hover 不會變深）
+     - 中深階(400~700)→ 近黑（按鈕、focus ring、強調變黑藥丸） */
+  --color-amber-50:  #F7F7F5 !important;
+  --color-amber-100: #EFEEEB !important;
+  --color-amber-200: #E3E1DC !important;
+  --color-amber-300: #A8A8A2 !important;
+  --color-amber-400: #2B2B2B !important;
+  --color-amber-500: #101010 !important;
+  --color-amber-600: #000000 !important;
+  --color-amber-700: #000000 !important;
+  --color-amber-800: #000000 !important;
+  --color-amber-900: #000000 !important;
+}
+
+/* ---- 2. 字體：genspark 乾淨無襯線 ---- */
+html, body {
+  background: var(--app-bg) !important;
+  font-family: "Inter", system-ui, -apple-system, "Segoe UI",
+               "PingFang TC", "Noto Sans TC", "Microsoft JhengHei", sans-serif !important;
+  color: #1A1A1A !important;
+}
+
+/* ---- 3. 主要按鈕：黑色全圓角藥丸（genspark CTA 風格） ---- */
+button.bg-gradient-to-b.from-amber-400,
+a.bg-gradient-to-b.from-amber-400,
+.bg-gradient-to-b.from-amber-400 {
+  background-image: linear-gradient(180deg, #2b2b2b 0%, #0a0a0a 100%) !important;
+  border-radius: 9999px !important;
+  box-shadow: 0 4px 14px -4px rgba(10, 10, 10, 0.35),
+              inset 0 1px 0 0 rgba(255, 255, 255, 0.12) !important;
+  color: #fff !important;
+}
+button.bg-gradient-to-b.from-amber-400:hover,
+.bg-gradient-to-b.from-amber-400:hover {
+  background-image: linear-gradient(180deg, #1a1a1a 0%, #000 100%) !important;
+}
+
+/* ---- 4. 主視覺：把 🐾 換成貓老闆 logo（由 proxy 同源供圖） ---- */
+/* 用 [aria-label][role] 兩個屬性提高優先序，蓋過第 3 段的漸層按鈕規則 */
+span[aria-label="paw"][role="img"] {
+  background-image: url("/dudu-cat.png") !important;
+  background-color: transparent !important;
+  background-size: contain !important;
+  background-position: center !important;
+  background-repeat: no-repeat !important;
+  box-shadow: none !important;
+  border-radius: 0 !important;
+  font-size: 0 !important;     /* 隱藏原本的 🐾 emoji */
+  color: transparent !important;
+  transition: transform 0.16s ease !important;
+  transform-origin: center !important;
+}
+/* logo hover：維持貓圖、只放大，不被第 3 段的黑色漸層蓋掉
+   (此選擇器 0,3,1 > .bg-gradient-to-b.from-amber-400:hover 0,3,0) */
+span[aria-label="paw"][role="img"]:hover {
+  background-image: url("/dudu-cat.png") !important;
+  transform: scale(1.12) !important;
+}
+
+/* ---- 5. 移除難看的線條（genspark 無這些分隔/強調線） ---- */
+/* 5a. 側欄選單項左側的強調直條（active 指示線） */
+aside a > span.absolute.left-0 { display: none !important; }
+/* 5b. 側欄：移除右分隔線；底色比主畫面略深（genspark 選單質感） */
+aside.glass-chrome {
+  border-right: 0 !important;
+  background: #F0EFEB !important;
+}
+/* 5c. 作用中選單項的環(ring)邊框 → 透明，只留柔和填色 chip */
+aside a { --tw-ring-color: transparent !important; }
+
+/* ---- 5d. 移除卡片上的彩色粗線（genspark 無這種粗 border） ---- */
+/* 卡片頂部 2px 彩色線（待辦/進行中/已完成/受阻 等狀態卡） */
+.border-t-2 { border-top-width: 0 !important; }
+/* 卡片左側 3px 彩色直條（emerald/amber/rose 等強調線） */
+span.absolute.left-0.rounded-r-full { display: none !important; }
+
+/* ---- 6. Hover：只放大 icon、文字不動（genspark 手感） ---- */
+aside a svg { transition: transform 0.16s ease !important; transform-origin: center; }
+aside a:hover svg { transform: scale(1.22) !important; }
+
+/* ---- 8. 彈窗 (dialog/modal)：genspark 風格 ---- */
+/* 置中（原本跑到左上角）、大圓角、無邊框、柔和陰影 */
+dialog.glass-overlay,
+dialog.glass-overlay[open] {
+  position: fixed !important;
+  top: 50% !important;
+  left: 50% !important;
+  right: auto !important;
+  bottom: auto !important;
+  transform: translate(-50%, -50%) !important;
+  margin: 0 !important;
+  border: 0 !important;
+  border-radius: 20px !important;
+  box-shadow: 0 24px 60px -20px rgba(20, 20, 20, 0.28),
+              0 8px 24px -12px rgba(20, 20, 20, 0.16) !important;
+}
+/* 遮罩：暗色半透明 + 輕模糊（genspark 手感；原本已接近，統一一下） */
+dialog.glass-overlay::backdrop {
+  background: rgba(20, 20, 20, 0.45) !important;
+  backdrop-filter: blur(3px) !important;
+}
+/* 底部按鈕：全寬堆疊；主要按鈕(深色)永遠在上（依角色排，不依賴 DOM 順序） */
+dialog.glass-overlay div.justify-end.gap-3 {
+  flex-direction: column !important;
+  align-items: stretch !important;
+}
+dialog.glass-overlay div.justify-end.gap-3 > button { width: 100% !important; }
+dialog.glass-overlay div.justify-end.gap-3 > button.from-amber-400,
+dialog.glass-overlay div.justify-end.gap-3 > button.bg-amber-500 { order: -1 !important; }
+
+/* 主要按鈕 disabled 時仍維持深色（原本 opacity-50 變太淺的淺灰） */
+dialog.glass-overlay button.from-amber-400:disabled {
+  opacity: 1 !important;
+  background-image: linear-gradient(180deg, #6b6b6b 0%, #4a4a4a 100%) !important;
+}
+
+/* ---- 8b. 全站 Tab（彈窗 + skills/settings 等頁面）：灰底 segmented 膠囊 → genspark 底線式 ---- */
+div.gap-1.rounded-lg.bg-stone-100 {
+  background: transparent !important;
+  padding: 0 !important;
+  border: 0 !important;                /* 移除 marketplace 變體的整圈框 */
+  border-radius: 0 !important;
+  gap: 0.75rem !important;
+  border-bottom: 1px solid var(--glass-border, #ECEAE6) !important;
+}
+div.gap-1.rounded-lg.bg-stone-100 > button {
+  background: transparent !important;
+  box-shadow: none !important;
+  border-radius: 0 !important;
+  color: #8A8A85 !important;
+  border-bottom: 2px solid transparent !important;
+  margin-bottom: -1px !important;
+  padding-top: 0.6rem !important;
+  padding-bottom: 0.6rem !important;
+  font-size: 0.95rem !important;   /* 放大 Tab 文字（原 text-xs 太小，貼近 genspark） */
+  white-space: nowrap !important;
+}
+/* active tab（bg-white 白膠囊 或 bg-amber-500 變體）→ 黑字 + 黑底線 */
+div.gap-1.rounded-lg.bg-stone-100 > button.bg-white,
+div.gap-1.rounded-lg.bg-stone-100 > button.bg-amber-500 {
+  color: #0A0A0A !important;
+  font-weight: 600 !important;
+  border-bottom-color: #0A0A0A !important;
+}
+
+/* ---- 9. WebChat：把 🐾 換成「打電腦的貓」 ---- */
+/* 7a. 聊天標題列的 DuDu 頭像（border-b 標題列 > 頭像列 > 第一個 text-2xl） */
+.border-b .items-center.gap-3 > span.text-2xl {
+  display: inline-block !important;
+  width: 2rem !important;
+  height: 2rem !important;
+  background: url("/dudu-cat-laptop.png") center/contain no-repeat !important;
+  font-size: 0 !important;
+  color: transparent !important;
+  vertical-align: middle !important;
+}
+/* 7b. 空對話時置中的大腳印（py-20 置中空狀態） */
+.py-20.text-center span.text-5xl {
+  display: inline-block !important;
+  width: 7rem !important;
+  height: 7rem !important;
+  background: url("/dudu-cat-laptop.png") center/contain no-repeat !important;
+  font-size: 0 !important;
+  color: transparent !important;
+}
