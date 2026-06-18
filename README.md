@@ -1,10 +1,14 @@
 # FutureBoss
 
-**Version 1.1.0**
+**Version 1.2.0**
 
 FutureBoss 是以 [DuDuClaw](https://github.com/zhixuli0406/DuDuClaw)（v1.20.0，Apache 2.0）為基礎客製化的 AI Agent 控制台，外觀參考 [Genspark](https://www.genspark.ai)，並調整為「單人使用」的精簡介面。
 
-後端 gateway 沿用官方安裝的 DuDuClaw v1.20.0；本專案只重建**前端**並透過一個本機反向代理把客製前端「換上去」，不需重新編譯 Rust binary。
+自 v1.2.0 起，repo 收錄**完整 fork 原始碼**（含後端全部 crates 與前端），fork 本專案即可取得完整可自行編譯的程式，無須另外取得官方 binary。`target/`、`node_modules/`、build 產物與密鑰（`.env`）不納入版控，請依下方步驟自行建置。
+
+兩種使用方式：
+- **A. 換膚模式（最快）**：沿用官方安裝的 DuDuClaw gateway，只建置前端 + 跑 `duduclaw-skin/proxy.js` 換上客製前端，不必編譯 Rust。
+- **B. 自編後端**：直接編譯 `duduclaw-fork/` 的 Rust gateway（含 Telegram 去 Markdown + typing indicator 等客製），取代官方 binary。
 
 ---
 
@@ -17,11 +21,15 @@ furtureboss/
 │   ├── skin.css                  # genspark 風格主題 + 側欄隱藏/排序 + Tab/彈窗樣式（即時生效）
 │   ├── text-replace.json         # 介面文字替換（品牌名、標籤…，即時生效）
 │   ├── cat.png / cat-laptop.png  # 貓老闆 logo 圖
-└── duduclaw-fork/
-    └── web/                      # fork 的前端原始碼（含原生新增頁面）
+└── duduclaw-fork/                # 完整 DuDuClaw fork 原始碼（Apache 2.0）
+    ├── crates/                   # 後端：21 個 Rust crates（gateway / agent / memory / security …）
+    ├── web/                      # 前端原始碼（含原生新增頁面）
+    ├── python/ · docs/ · tests/  # Python 工具、文件、測試
+    ├── run-fork-gateway.sh       # 自編 gateway 啟停/回滾腳本
+    └── Cargo.toml · LICENSE …    # fork 原專案檔
 ```
 
-> `node_modules/` 與 build 產物（`duduclaw-fork/crates/`、`dist/`）不納入版控，請依下方步驟自行建置。
+> `target/`、`node_modules/`、build 產物（`dist/`）與密鑰（`.env`）不納入版控，請依下方步驟自行建置。
 
 ---
 
@@ -38,7 +46,11 @@ furtureboss/
 
 ## 建置與啟動
 
-前置：已安裝並初始化 DuDuClaw（gateway 跑在 `127.0.0.1:18789`）、Node.js。
+前置：Node.js；自編後端另需 Rust（edition 2024，需 ≥1.85）。
+
+### A. 換膚模式（沿用官方 gateway，不編譯 Rust）
+
+前置：已安裝並初始化 DuDuClaw（gateway 跑在 `127.0.0.1:18789`）。
 
 ```bash
 # 1) 建置 fork 前端
@@ -54,13 +66,29 @@ node proxy.js        # 預設 http://localhost:18790
 
 開瀏覽器進 **http://localhost:18790**。
 
+### B. 自編後端 gateway（含 Telegram 客製）
+
+```bash
+cd duduclaw-fork
+cargo build --release -p duduclaw-cli --bin duduclaw
+# 啟停/回滾（沿用 ~/.duduclaw 設定，port 127.0.0.1:18789）
+./run-fork-gateway.sh start    # 其他：stop | rollback | build | status
+```
+
 ### 環境變數（proxy.js）
 - `DUDU_UPSTREAM_HOST` / `DUDU_UPSTREAM_PORT`：gateway 位址（預設 `127.0.0.1:18789`）
 - `DUDU_SKIN_PORT`：代理埠（預設 `18790`）
 
+後端所需 API 金鑰／channel token 見 `duduclaw-fork/.env.example`。
+
 ---
 
 ## 更新紀錄
+
+### v1.2.0
+- **收錄完整 fork 原始碼**：`duduclaw-fork/` 從「僅前端 web」擴充為完整 DuDuClaw fork（後端全部 crates + 前端 + Python 工具 + 文件），fork 本專案即可取得可自行編譯的完整程式。
+- 新增自編後端 gateway 的建置/啟停說明（含 `run-fork-gateway.sh`）。
+- `.gitignore` 調整：改以排除 `target/` 等 build 產物，不再排除後端 `crates/`。
 
 ### v1.1.0
 - **連線錯誤處理**：gateway 未啟動/無法連線時，登入與記憶等頁面改為顯示清楚的中文提示（HTTP 狀態），不再出現難以理解的 `Unexpected token` 解析錯誤（`auth-store.ts` 新增防禦性 JSON 解析）。

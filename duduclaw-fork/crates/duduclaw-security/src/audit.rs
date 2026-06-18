@@ -1,0 +1,458 @@
+//! Security audit event log — append-only JSONL file.
+//!
+//! [C-2b] All security events (drift, injection, quarantine) are persisted
+//! to `~/.duduclaw/security_audit.jsonl` for forensic review.
+
+use std::path::Path;
+
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
+use tracing::warn;
+
+/// Severity level of a security event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Severity {
+    Info,
+    Warning,
+    Critical,
+}
+
+/// A single security audit event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditEvent {
+    pub timestamp: String,
+    pub event_type: String,
+    pub agent_id: String,
+    pub severity: Severity,
+    pub details: serde_json::Value,
+}
+
+impl AuditEvent {
+    /// Create a new audit event with the current timestamp.
+    pub fn new(
+        event_type: impl Into<String>,
+        agent_id: impl Into<String>,
+        severity: Severity,
+        details: serde_json::Value,
+    ) -> Self {
+        Self {
+            timestamp: Utc::now().to_rfc3339(),
+            event_type: event_type.into(),
+            agent_id: agent_id.into(),
+            severity,
+            details,
+        }
+    }
+}
+
+/// Append an audit event to the security log file.
+///
+/// The log is stored at `<home_dir>/security_audit.jsonl`.
+/// This function is synchronous (blocking I/O) and suitable for
+/// calling from both sync and async contexts via `spawn_blocking`.
+pub fn append_audit_event(home_dir: &Path, event: &AuditEvent) {
+    let path = home_dir.join("security_audit.jsonl");
+    let json = match serde_json::to_string(event) {
+        Ok(j) => j,
+        Err(e) => {
+            warn!("Failed to serialize audit event: {e}");
+            return;
+        }
+    };
+
+    use std::io::Write;
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        Ok(mut f) => {
+            // Use advisory file lock to prevent multi-process write corruption (MW-H2)
+            if let Err(e) = duduclaw_core::platform::flock_exclusive(&f) {
+                warn!("flock failed on audit log: {e}");
+            }
+            if let Err(e) = writeln!(f, "{json}") {
+                warn!("Failed to write audit event: {e}");
+            }
+            // Lock automatically released when file is dropped
+        }
+        Err(e) => {
+            warn!("Failed to open audit log {}: {e}", path.display());
+        }
+    }
+}
+
+/// Read recent audit events (last N entries).
+///
+/// Simplified: collect all lines, then slice the tail (MW-L2).
+/// For very large files, consider using a reverse-line reader crate.
+pub fn read_recent_events(home_dir: &Path, limit: usize) -> Vec<AuditEvent> {
+    let path = home_dir.join("security_audit.jsonl");
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+
+    let lines: Vec<&str> = content.lines().collect();
+    let start = lines.len().saturating_sub(limit);
+
+    lines[start..]
+        .iter()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
+/// Count events by severity since a given timestamp.
+///
+/// Uses proper ISO 8601 DateTime parsing instead of string prefix
+/// comparison to avoid incorrect ordering (MW-M3).
+pub fn count_events_since(
+    home_dir: &Path,
+    since: &str,
+) -> (usize, usize, usize) {
+    let path = home_dir.join("security_audit.jsonl");
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return (0, 0, 0),
+    };
+
+    let since_dt = chrono::DateTime::parse_from_rfc3339(since)
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .unwrap_or_else(|_| chrono::Utc::now() - chrono::Duration::hours(24));
+
+    let mut info = 0usize;
+    let mut warning = 0usize;
+    let mut critical = 0usize;
+
+    for line in content.lines() {
+        if let Ok(event) = serde_json::from_str::<AuditEvent>(line) {
+            let event_time = chrono::DateTime::parse_from_rfc3339(&event.timestamp)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .ok();
+            if event_time.is_some_and(|t| t >= since_dt) {
+                match event.severity {
+                    Severity::Info => info += 1,
+                    Severity::Warning => warning += 1,
+                    Severity::Critical => critical += 1,
+                }
+            }
+        }
+    }
+
+    (info, warning, critical)
+}
+
+// ── Convenience constructors for common events ──────────────
+
+/// Log a SOUL.md drift detection event.
+pub fn log_soul_drift(home_dir: &Path, agent_id: &str, expected: &str, actual: &str) {
+    let event = AuditEvent::new(
+        "soul_drift",
+        agent_id,
+        Severity::Critical,
+        serde_json::json!({
+            "expected_hash": expected,
+            "actual_hash": actual,
+        }),
+    );
+    append_audit_event(home_dir, &event);
+}
+
+/// Log a prompt injection detection event.
+pub fn log_injection_detected(
+    home_dir: &Path,
+    agent_id: &str,
+    risk_score: u32,
+    matched_rules: &[String],
+    blocked: bool,
+) {
+    let severity = if blocked {
+        Severity::Critical
+    } else {
+        Severity::Warning
+    };
+    let event = AuditEvent::new(
+        "prompt_injection",
+        agent_id,
+        severity,
+        serde_json::json!({
+            "risk_score": risk_score,
+            "matched_rules": matched_rules,
+            "blocked": blocked,
+        }),
+    );
+    append_audit_event(home_dir, &event);
+}
+
+/// Log a skill quarantine event.
+pub fn log_skill_quarantined(home_dir: &Path, agent_id: &str, skill_name: &str, reason: &str) {
+    let event = AuditEvent::new(
+        "skill_quarantined",
+        agent_id,
+        Severity::Warning,
+        serde_json::json!({
+            "skill_name": skill_name,
+            "reason": reason,
+        }),
+    );
+    append_audit_event(home_dir, &event);
+}
+
+// ── Tool call audit trail ─────────────────────────────────────
+
+/// Log a successful MCP tool call for post-action audit verification.
+///
+/// Written to `tool_calls.jsonl` (separate from security_audit.jsonl)
+/// so the action claim verifier can cross-reference agent outputs.
+pub fn append_tool_call(
+    home_dir: &Path,
+    agent_id: &str,
+    tool_name: &str,
+    params_summary: &str,
+    success: bool,
+) {
+    append_tool_call_with_extras(home_dir, agent_id, tool_name, params_summary, success, &[])
+}
+
+/// Variant of [`append_tool_call`] that attaches additional fields to the
+/// audit record. Used by `shared_wiki_write` to record `claimed_authors_in_content`
+/// and `matches_caller` (RFC-22 Decision 4-D, Phase 3 W2) so post-hoc audit
+/// can detect when an agent wrote a wiki page that *claims* multi-agent
+/// authorship but only one caller actually invoked the tool — e.g. the
+/// 5/5 trace where agnes wrote a "## DuDuClaw PM 觀點" section after the
+/// pm spawn failed.
+///
+/// Extras are attached as top-level JSON fields. They MUST NOT collide with
+/// the canonical fields (`timestamp`, `agent_id`, `tool_name`, `params_summary`,
+/// `success`); when collision occurs the canonical field wins.
+pub fn append_tool_call_with_extras(
+    home_dir: &Path,
+    agent_id: &str,
+    tool_name: &str,
+    params_summary: &str,
+    success: bool,
+    extras: &[(&str, serde_json::Value)],
+) {
+    const RESERVED: &[&str] = &[
+        "timestamp",
+        "agent_id",
+        "tool_name",
+        "params_summary",
+        "success",
+    ];
+    let path = home_dir.join("tool_calls.jsonl");
+    maybe_rotate_tool_calls(&path);
+    let mut map = serde_json::Map::new();
+    map.insert("timestamp".into(), Utc::now().to_rfc3339().into());
+    map.insert("agent_id".into(), agent_id.into());
+    map.insert("tool_name".into(), tool_name.into());
+    map.insert("params_summary".into(), params_summary.into());
+    map.insert("success".into(), success.into());
+    for (key, value) in extras {
+        if RESERVED.contains(key) {
+            warn!(
+                "tool_call extra field '{key}' collides with canonical name; ignored"
+            );
+            continue;
+        }
+        map.insert((*key).to_string(), value.clone());
+    }
+    let record = serde_json::Value::Object(map);
+    let json = match serde_json::to_string(&record) {
+        Ok(j) => j,
+        Err(e) => {
+            warn!("Failed to serialize tool call record: {e}");
+            return;
+        }
+    };
+
+    use std::io::Write;
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        Ok(mut f) => {
+            let _ = duduclaw_core::platform::flock_exclusive(&f);
+            if let Err(e) = writeln!(f, "{json}") {
+                warn!("Failed to write tool call record: {e}");
+            }
+        }
+        Err(e) => {
+            warn!("Failed to open tool_calls.jsonl: {e}");
+        }
+    }
+}
+
+/// Read tool call records for a specific agent within a time window.
+///
+/// Uses `flock(LOCK_SH)` to prevent reading partially-written lines
+/// while `append_tool_call()` holds `LOCK_EX`.
+pub fn read_tool_calls_since(
+    home_dir: &Path,
+    agent_id: &str,
+    since: &str,
+) -> Vec<serde_json::Value> {
+    let path = home_dir.join("tool_calls.jsonl");
+    let file = match std::fs::File::open(&path) {
+        Ok(f) => f,
+        Err(_) => return Vec::new(),
+    };
+
+    // Acquire shared lock to prevent reading during a concurrent write
+    let _ = duduclaw_core::platform::flock_shared(&file);
+
+    use std::io::Read;
+    let mut content = String::new();
+    let mut reader = std::io::BufReader::new(file);
+    if reader.read_to_string(&mut content).is_err() {
+        return Vec::new();
+    }
+
+    // Fallback to 0 seconds ago (empty window) if `since` is unparseable,
+    // to avoid accidentally including old records.
+    // Apply 2-second grace period to handle clock precision issues between
+    // the dispatcher recording dispatch_start and the MCP server recording
+    // tool call timestamps (review round 2).
+    let since_dt = chrono::DateTime::parse_from_rfc3339(since)
+        .map(|dt| dt.with_timezone(&chrono::Utc) - chrono::Duration::seconds(2))
+        .unwrap_or_else(|_| chrono::Utc::now());
+
+    content
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|record| {
+            let matches_agent = record
+                .get("agent_id")
+                .and_then(|v| v.as_str())
+                .is_some_and(|id| id == agent_id);
+            let after_since = record
+                .get("timestamp")
+                .and_then(|v| v.as_str())
+                .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
+                .is_some_and(|dt| dt.with_timezone(&chrono::Utc) >= since_dt);
+            matches_agent && after_since
+        })
+        .collect()
+}
+
+/// Rotate `tool_calls.jsonl` if it exceeds 5 MB.
+///
+/// Renames the current file to `.jsonl.old` (overwriting any previous backup)
+/// and starts a fresh file. Only checks file size every 64 calls to avoid
+/// a `metadata()` syscall on every tool call (review R3-L1).
+/// Concurrent callers may both attempt `rename` — the loser gets ENOENT
+/// which is silently ignored since a fresh file will be created on the
+/// next `append` (review R3-L4).
+fn maybe_rotate_tool_calls(path: &std::path::Path) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static CALL_COUNT: AtomicU32 = AtomicU32::new(0);
+
+    // Check every 64 calls (~1 metadata syscall per 64 tool invocations)
+    if !CALL_COUNT.fetch_add(1, Ordering::Relaxed).is_multiple_of(64) {
+        return;
+    }
+
+    const MAX_SIZE: u64 = 5 * 1024 * 1024; // 5 MB
+    if let Ok(meta) = std::fs::metadata(path)
+        && meta.len() > MAX_SIZE {
+            let backup = path.with_extension("jsonl.old");
+            // Ignore ENOENT: a concurrent caller may have already rotated.
+            match std::fs::rename(path, &backup) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => warn!("Failed to rotate tool_calls.jsonl: {e}"),
+            }
+        }
+}
+
+/// Log a tool hallucination detection event.
+pub fn log_tool_hallucination(
+    home_dir: &Path,
+    agent_id: &str,
+    claimed_action: &str,
+    expected_tool: &str,
+) {
+    let event = AuditEvent::new(
+        "tool_hallucination",
+        agent_id,
+        Severity::Critical,
+        serde_json::json!({
+            "claimed_action": claimed_action,
+            "expected_tool": expected_tool,
+            "explanation": "Agent claimed to perform an action without calling the corresponding MCP tool",
+        }),
+    );
+    append_audit_event(home_dir, &event);
+}
+
+// ── Killswitch / Safety Filter audit events ───────────────────
+
+/// Log a safety word trigger event.
+pub fn log_safety_word(
+    home_dir: &Path,
+    agent_id: &str,
+    scope: &str,
+    user_id: &str,
+    action: &str,
+) {
+    let event = AuditEvent::new(
+        "safety_word_triggered",
+        agent_id,
+        Severity::Critical,
+        serde_json::json!({
+            "scope": scope,
+            "user_id": user_id,
+            "action": action,
+        }),
+    );
+    append_audit_event(home_dir, &event);
+}
+
+/// Log a circuit breaker trip event.
+pub fn log_circuit_breaker_trip(
+    home_dir: &Path,
+    agent_id: &str,
+    scope: &str,
+    reason: &str,
+) {
+    let event = AuditEvent::new(
+        "circuit_breaker_tripped",
+        agent_id,
+        Severity::Warning,
+        serde_json::json!({
+            "scope": scope,
+            "reason": reason,
+        }),
+    );
+    append_audit_event(home_dir, &event);
+}
+
+/// Log a failsafe level change event.
+pub fn log_failsafe_change(
+    home_dir: &Path,
+    agent_id: &str,
+    scope: &str,
+    from_level: &str,
+    to_level: &str,
+    reason: &str,
+) {
+    let severity = if to_level.contains("L4") || to_level.contains("L3") {
+        Severity::Critical
+    } else {
+        Severity::Warning
+    };
+    let event = AuditEvent::new(
+        "failsafe_level_changed",
+        agent_id,
+        severity,
+        serde_json::json!({
+            "scope": scope,
+            "from": from_level,
+            "to": to_level,
+            "reason": reason,
+        }),
+    );
+    append_audit_event(home_dir, &event);
+}

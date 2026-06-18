@@ -1,0 +1,5695 @@
+//! Shared AI reply builder for all channel bots.
+//!
+//! Calls the Claude Code SDK (Python) via subprocess for AI responses,
+//! using the multi-account rotator for key management and budget tracking.
+//! Falls back to direct Anthropic API if Python is unavailable.
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use duduclaw_agent::registry::AgentRegistry;
+use duduclaw_agent::resolver::AgentResolver;
+use tokio::sync::RwLock;
+use tracing::{debug, info, warn};
+
+use duduclaw_core::MemoryEngine;
+use duduclaw_core::types::{Message, MessageType};
+use duduclaw_security::circuit_breaker::CircuitBreakerRegistry;
+use duduclaw_security::failsafe::FailsafeManager;
+use duduclaw_security::killswitch::KillswitchConfig;
+
+use crate::channel_settings::ChannelSettingsManager;
+use crate::evolution_events::emitter::EvolutionEventEmitter;
+use crate::handlers::ChannelState;
+use crate::gvu::loop_::GvuLoop;
+use crate::prediction::engine::PredictionEngine;
+use crate::session::SessionManager;
+use crate::skill_extraction::recorder::{
+    Sentiment, SkillCache, SkillExtractor, TrajectoryOutcome, TrajectoryRecorder,
+};
+use crate::skill_lifecycle::activation::SkillActivationController;
+use crate::skill_lifecycle::compression::CompressedSkillCache;
+use crate::skill_lifecycle::gap_accumulator::GapAccumulator;
+use crate::skill_lifecycle::lift::LiftTrackerStore;
+use crate::skill_lifecycle::sandbox_trial::SandboxStore;
+
+/// Shared channel status map, accessible by both channel bots and the RPC handler.
+pub type ChannelStatusMap = Arc<RwLock<std::collections::HashMap<String, ChannelState>>>;
+
+// ── Multi-turn conversation types ──────────────────────────
+
+/// A single turn in conversation history, used for native multi-turn support.
+#[derive(Debug, Clone)]
+pub struct ConversationTurn {
+    pub role: String,    // "user" | "assistant"
+    pub content: String,
+}
+
+/// Maximum character count for a single turn before it gets trimmed.
+/// Inspired by Hermes Agent's tool output trimming (Phase 1 compression).
+const TURN_TRIM_THRESHOLD: usize = 800;
+const TURN_HEAD_CHARS: usize = 300;
+const TURN_TAIL_CHARS: usize = 200;
+
+/// #12 glue (2026-05-12) — apply the prompt-compression pipeline when an
+/// agent's `[budget] max_input_tokens` is set AND the request is over
+/// budget. Returns either the compressed history (success) or the
+/// original history (no budget configured / not over / pipeline failed).
+///
+/// Why not propagate errors: the 200K cliff doubles input price but
+/// doesn't break the call. Silent fallback preserves availability;
+/// the `cost_pressure` event surfaces the regression for auditing.
+fn maybe_compress_history(
+    system_prompt: &str,
+    history: Vec<ConversationTurn>,
+    user_message: &str,
+    agent_id: &str,
+) -> Vec<ConversationTurn> {
+    // Look up the budget from cost_telemetry's cached agent config. We
+    // can't get the LoadedAgent at this point without re-acquiring the
+    // registry lock — instead let the per-agent budget read happen via
+    // a small helper. Default 0 (= disabled) preserves prior behaviour.
+    let budget = read_agent_budget_tokens(agent_id);
+    if budget == 0 {
+        return history;
+    }
+
+    // Snapshot of the cost_pressure flag so the pipeline can pick a
+    // more aggressive trim threshold for hot agents.
+    let cost_pressure = crate::cost_telemetry::get_telemetry()
+        .map(|t| t.is_under_cost_pressure(agent_id))
+        .unwrap_or(false);
+
+    // Convert ConversationTurn → OwnedChatMessage. Pipeline returns
+    // OwnedChatMessage, which we map back below.
+    let owned: Vec<crate::prompt_compression::OwnedChatMessage> = history
+        .iter()
+        .map(|t| crate::prompt_compression::OwnedChatMessage {
+            role: t.role.clone(),
+            content: t.content.clone(),
+        })
+        .collect();
+
+    match crate::prompt_compression::enforce_budget(
+        system_prompt,
+        owned,
+        user_message,
+        budget,
+        crate::prompt_compression::default_pipeline(),
+        cost_pressure,
+    ) {
+        Ok(compressed) => {
+            // If the pipeline didn't need to do anything (under budget),
+            // it returns the input unchanged — caller doesn't care.
+            compressed
+                .into_iter()
+                .map(|m| ConversationTurn {
+                    role: m.role,
+                    content: m.content,
+                })
+                .collect()
+        }
+        Err(exceeded) => {
+            // Non-fatal degradation: log, emit a cost-pressure-like
+            // signal, fall through with original history. This keeps
+            // the call working at higher cost rather than mysteriously
+            // failing.
+            tracing::warn!(
+                agent_id,
+                estimated = exceeded.estimated_tokens,
+                budget = exceeded.budget_tokens,
+                stages = ?exceeded.stages_tried,
+                "budget enforcement: compression pipeline insufficient; \
+                 proceeding with full history (request will be expensive)"
+            );
+            history
+        }
+    }
+}
+
+/// Helper for [`maybe_compress_history`]. Reads
+/// `agent.toml [budget] max_input_tokens` for the given agent. Returns
+/// 0 (= disabled) on any failure, preserving v1.12.x behaviour for
+/// agents that haven't opted in.
+fn read_agent_budget_tokens(agent_id: &str) -> u64 {
+    // Resolve the agent dir from the gateway's home dir at runtime.
+    // We avoid threading `home_dir` through this hot path by going via
+    // the well-known DUDUCLAW_HOME / ~/.duduclaw convention used
+    // everywhere else in the codebase.
+    let home = std::env::var("DUDUCLAW_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            dirs::home_dir()
+                .unwrap_or_default()
+                .join(".duduclaw")
+        });
+    let agent_dir = home.join("agents").join(agent_id);
+    crate::prompt_audit::read_max_input_tokens(&agent_dir).unwrap_or(0)
+}
+
+/// Trim a turn's content if it exceeds the threshold (char-level, CJK-safe).
+///
+/// Preserves the first and last portions, replacing the middle with a
+/// "[trimmed N chars]" placeholder. Zero LLM cost — pure text surgery.
+/// Inspired by Hermes Agent's 4-phase compression (Phase 1: tool output trimming).
+fn trim_turn_content(content: &str) -> String {
+    let char_count = content.chars().count();
+    if char_count <= TURN_TRIM_THRESHOLD {
+        return content.to_string();
+    }
+    // char-level slicing to avoid panic on multi-byte UTF-8 (CJK)
+    let head: String = content.chars().take(TURN_HEAD_CHARS).collect();
+    let tail: String = content.chars().skip(char_count - TURN_TAIL_CHARS).collect();
+    let trimmed = char_count - TURN_HEAD_CHARS - TURN_TAIL_CHARS;
+    format!("{}…\n[trimmed {} chars]\n…{}", head, trimmed, tail)
+}
+
+/// Format conversation history as an XML-delimited prompt prefix.
+///
+/// Used by CLI-based runtimes (Gemini, Codex) and as a fallback for Claude CLI
+/// when `--resume` is unavailable (e.g., account rotation changed session store).
+///
+/// Applies Hermes-inspired optimizations:
+/// - Long turns (>800 chars) are trimmed with head/tail preservation
+/// - Keeps conversation structure intact while reducing token usage
+pub(crate) fn format_history_as_prompt(history: &[ConversationTurn], current_message: &str) -> String {
+    if history.is_empty() {
+        return current_message.to_string();
+    }
+    let mut buf = String::with_capacity(history.len() * 200 + current_message.len() + 64);
+    buf.push_str("<conversation_history>\n");
+    for turn in history {
+        let content = trim_turn_content(&turn.content);
+        // Escape closing tags in content to prevent XML structure corruption
+        let safe_content = content
+            .replace("</user>", "&lt;/user&gt;")
+            .replace("</assistant>", "&lt;/assistant&gt;");
+        buf.push('<');
+        buf.push_str(&turn.role);
+        buf.push('>');
+        buf.push_str(&safe_content);
+        buf.push_str("</");
+        buf.push_str(&turn.role);
+        buf.push_str(">\n");
+    }
+    buf.push_str("</conversation_history>\n\n");
+    buf.push_str(current_message);
+    buf
+}
+
+/// Lightweight sub-agent descriptor for system prompt injection.
+#[derive(Debug, Clone)]
+pub(crate) struct TeamMember {
+    pub name: String,
+    pub display_name: String,
+    pub role: String,
+}
+
+// ── Shared state ────────────────────────────────────────────
+
+/// Shared context for building replies, initialized once at gateway start.
+pub struct ReplyContext {
+    pub registry: Arc<RwLock<AgentRegistry>>,
+    pub home_dir: PathBuf,
+    pub http: reqwest::Client,
+    pub session_manager: Arc<SessionManager>,
+    pub channel_status: ChannelStatusMap,
+    /// Broadcast sender for pushing events (e.g. channel status changes) to WebSocket clients.
+    pub event_tx: tokio::sync::broadcast::Sender<String>,
+    /// Prediction engine for event-driven evolution.
+    pub prediction_engine: Option<Arc<PredictionEngine>>,
+    /// GVU evolution loop (Phase 2).
+    pub gvu_loop: Option<Arc<GvuLoop>>,
+    /// Skill lifecycle: compressed skill cache.
+    pub skill_cache: Arc<tokio::sync::Mutex<CompressedSkillCache>>,
+    /// Skill lifecycle: activation controller.
+    pub skill_activation: Arc<tokio::sync::Mutex<SkillActivationController>>,
+    /// Skill lifecycle: lift tracker store.
+    pub skill_lift: Arc<tokio::sync::Mutex<LiftTrackerStore>>,
+    /// Skill lifecycle: gap accumulator for auto-synthesis triggering.
+    pub gap_accumulator: Arc<tokio::sync::Mutex<GapAccumulator>>,
+    /// Skill lifecycle: sandbox store for trial skills.
+    pub sandbox_store: Arc<tokio::sync::Mutex<SandboxStore>>,
+    /// Sessions with voice reply mode enabled (toggled by /voice command).
+    pub voice_sessions: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Per-channel, per-scope settings (mention_only, whitelist, auto_thread, etc.).
+    pub channel_settings: Arc<ChannelSettingsManager>,
+    /// Killswitch configuration (safety words, thresholds, escalation).
+    pub killswitch: Arc<KillswitchConfig>,
+    /// Failsafe degradation manager (per-scope level tracking).
+    pub failsafe: Option<Arc<FailsafeManager>>,
+    /// Circuit breaker registry (per-scope anomaly detection).
+    pub circuit_breakers: Option<Arc<CircuitBreakerRegistry>>,
+    /// Mistake notebook for grounded GVU evolution (Phase 1 GVU²).
+    pub mistake_notebook: Option<Arc<crate::gvu::mistake_notebook::MistakeNotebook>>,
+    /// Trajectory recorder for skill extraction (Phase 3).
+    pub skill_recorder: Arc<tokio::sync::Mutex<TrajectoryRecorder>>,
+    /// Persistent skill bank for extracted skills (Phase 3).
+    pub skill_bank: Arc<tokio::sync::Mutex<SkillCache>>,
+    /// Path to memory.db for key-fact accumulator (P2).
+    /// Engine is created on-demand per operation due to SQLite thread safety.
+    pub memory_db_path: Option<PathBuf>,
+    /// EvolutionEvents audit-log emitter (Sprint N P0).
+    ///
+    /// Non-blocking: all emit calls fire-and-forget via tokio::spawn.
+    pub evolution_emitter: Arc<EvolutionEventEmitter>,
+    /// RFC-23 redaction pipeline. `None` ⇒ disabled (existing behaviour).
+    pub redaction_manager: Option<Arc<duduclaw_redaction::RedactionManager>>,
+}
+
+impl ReplyContext {
+    pub fn new(
+        registry: Arc<RwLock<AgentRegistry>>,
+        home_dir: PathBuf,
+        session_manager: Arc<SessionManager>,
+        channel_status: ChannelStatusMap,
+        event_tx: tokio::sync::broadcast::Sender<String>,
+    ) -> Self {
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .unwrap_or_default();
+        // Co-locate channel settings in the session database
+        let db_path = home_dir.join("sessions.db");
+        let channel_settings = ChannelSettingsManager::from_session_db(&db_path)
+            .unwrap_or_else(|e| {
+                warn!("Channel settings init failed ({e}), using in-memory fallback");
+                ChannelSettingsManager::new(Path::new(":memory:"))
+                    .expect("in-memory DB should always succeed")
+            });
+        // Load killswitch config from ~/.duduclaw/KILLSWITCH.toml
+        let ks_path = home_dir.join("KILLSWITCH.toml");
+        let killswitch = KillswitchConfig::load(&ks_path);
+
+        // Initialize failsafe manager and circuit breaker registry
+        let failsafe = Arc::new(FailsafeManager::new(killswitch.failsafe.clone()));
+        let circuit_breakers = Arc::new(CircuitBreakerRegistry::new(
+            killswitch.circuit_breaker.clone(),
+        ));
+
+        Self {
+            registry,
+            home_dir,
+            http,
+            session_manager,
+            channel_status,
+            event_tx,
+            prediction_engine: None,
+            gvu_loop: None,
+            skill_cache: Arc::new(tokio::sync::Mutex::new(CompressedSkillCache::new())),
+            skill_activation: Arc::new(tokio::sync::Mutex::new(SkillActivationController::new(5))),
+            skill_lift: Arc::new(tokio::sync::Mutex::new(LiftTrackerStore::new())),
+            gap_accumulator: Arc::new(tokio::sync::Mutex::new(GapAccumulator::new(3, 24))),
+            sandbox_store: Arc::new(tokio::sync::Mutex::new(SandboxStore::new())),
+            voice_sessions: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+            channel_settings: Arc::new(channel_settings),
+            killswitch: Arc::new(killswitch),
+            failsafe: Some(failsafe),
+            circuit_breakers: Some(circuit_breakers),
+            mistake_notebook: None,
+            skill_recorder: Arc::new(tokio::sync::Mutex::new(TrajectoryRecorder::new())),
+            skill_bank: Arc::new(tokio::sync::Mutex::new(SkillCache::new())),
+            memory_db_path: None,
+            evolution_emitter: Arc::new(EvolutionEventEmitter::from_env()),
+            redaction_manager: None,
+        }
+    }
+
+    /// Inject the redaction manager. `None` (default) ⇒ no redaction.
+    pub fn with_redaction_manager(
+        mut self,
+        manager: Option<Arc<duduclaw_redaction::RedactionManager>>,
+    ) -> Self {
+        self.redaction_manager = manager;
+        self
+    }
+
+    /// Create with prediction engine enabled.
+    pub fn with_prediction_engine(mut self, engine: Arc<PredictionEngine>) -> Self {
+        self.prediction_engine = Some(engine);
+        self
+    }
+
+    /// Create with GVU evolution loop enabled.
+    pub fn with_gvu_loop(mut self, gvu: Arc<GvuLoop>) -> Self {
+        self.gvu_loop = Some(gvu);
+        self
+    }
+
+    /// Create with MistakeNotebook for grounded GVU evolution.
+    pub fn with_mistake_notebook(mut self, nb: Arc<crate::gvu::mistake_notebook::MistakeNotebook>) -> Self {
+        self.mistake_notebook = Some(nb);
+        self
+    }
+
+    /// Set memory DB path for cross-session key-fact accumulator (P2).
+    pub fn with_memory_db(mut self, path: PathBuf) -> Self {
+        self.memory_db_path = Some(path);
+        self
+    }
+}
+
+/// Helper to update a channel's connection state and broadcast the change to dashboard clients.
+pub async fn set_channel_connected(status: &ChannelStatusMap, name: &str, connected: bool, error: Option<String>, event_tx: Option<&tokio::sync::broadcast::Sender<String>>) {
+    let now = chrono::Utc::now();
+    let error_clone = error.clone();
+    {
+        let mut map = status.write().await;
+        map.insert(name.to_string(), ChannelState {
+            connected,
+            last_event: Some(now),
+            error,
+        });
+    }
+    // Broadcast status change to WebSocket clients for real-time dashboard updates
+    if let Some(tx) = event_tx {
+        let event = crate::protocol::WsFrame::event(
+            "channels.status_changed",
+            serde_json::json!({
+                "name": name,
+                "connected": connected,
+                "last_connected": now.to_rfc3339(),
+                "error": error_clone,
+            }),
+        );
+        if let Ok(json) = serde_json::to_string(&event) {
+            let _ = tx.send(json);
+        }
+    }
+}
+
+// ── User sentiment detection ───────────────────────────────
+
+/// Detect user satisfaction heuristic from message text (zero LLM cost).
+///
+/// Positive signals: gratitude, approval, emoji thumbs-up, CJK equivalents.
+/// Negative signals: corrections, complaints, error reports, CJK equivalents.
+/// Returns `None` if no clear signal detected (neutral message).
+fn detect_user_sentiment(text: &str) -> Option<Sentiment> {
+    let lower = text.to_lowercase();
+    let positive_signals = [
+        "thanks",
+        "thank you",
+        "great",
+        "good",
+        "perfect",
+        "awesome",
+        "nice",
+        "\u{1f44d}", // 👍
+        "\u{1f389}", // 🎉
+        "\u{2705}",  // ✅
+        "\u{8b1d}\u{8b1d}",     // 謝謝
+        "\u{611f}\u{8b1d}",     // 感謝
+        "\u{5b8c}\u{7f8e}",     // 完美
+        "\u{597d}\u{7684}",     // 好的
+        "\u{8b9a}",             // 讚
+        "\u{592a}\u{597d}\u{4e86}", // 太好了
+        "\u{5f88}\u{597d}",     // 很好
+    ];
+    let negative_signals = [
+        "no",
+        "wrong",
+        "incorrect",
+        "fix",
+        "error",
+        "bug",
+        "\u{4e0d}\u{5c0d}",     // 不對
+        "\u{932f}\u{4e86}",     // 錯了
+        "\u{91cd}\u{4f86}",     // 重來
+        "\u{4e0d}\u{884c}",     // 不行
+        "\u{4fee}\u{6b63}",     // 修正
+        "\u{6709}\u{554f}\u{984c}", // 有問題
+    ];
+
+    if positive_signals.iter().any(|s| lower.contains(s)) {
+        Some(Sentiment::Positive)
+    } else if negative_signals.iter().any(|s| lower.contains(s)) {
+        Some(Sentiment::Negative)
+    } else {
+        None
+    }
+}
+
+// ── Public API ──────────────────────────────────────────────
+
+/// Build a reply for an incoming user message (no user tracking).
+///
+/// Strategy:
+/// 1. Try Python Claude Code SDK (subprocess) — uses rotator + budget tracking
+/// 2. Fallback to direct Anthropic API (Rust reqwest) — single key only
+/// 3. Fallback to static error message
+pub async fn build_reply(text: &str, ctx: &ReplyContext) -> String {
+    build_reply_with_session(text, ctx, "default", "anonymous", None).await
+}
+
+/// RFC-23: restore any `<REDACT:...>` tokens in the reply text using the
+/// agent's per-session vault. Caller is always `owner` since the text is
+/// destined for the channel's end-user. Errors are swallowed (return the
+/// raw text — tokens stay verbatim, which is safe).
+async fn restore_for_channel(
+    text: String,
+    ctx: &ReplyContext,
+    agent_id: &str,
+    session_id: &str,
+) -> String {
+    let Some(manager) = ctx.redaction_manager.as_ref() else {
+        return text;
+    };
+    // Quick scan: if there's no `<REDACT:` substring at all, skip the
+    // pipeline construction entirely (hot path).
+    if !text.contains(duduclaw_redaction::token::TOKEN_PREFIX) {
+        return text;
+    }
+    let pipeline = match manager.pipeline(agent_id, Some(session_id.to_string())) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(error = %e, agent = %agent_id, "redaction: pipeline build failed; returning raw text");
+            return text;
+        }
+    };
+    let caller = duduclaw_redaction::Caller::owner(agent_id);
+    pipeline
+        .restore(&text, &caller, duduclaw_redaction::RestoreTarget::UserChannel)
+        .unwrap_or_else(|e| {
+            warn!(error = %e, "redaction: restore failed; returning raw text");
+            text
+        })
+}
+
+/// Best-effort agent-id resolution for outer restore wrappers — mirrors
+/// the order used by `build_reply_with_session_inner` but without the
+/// trigger-word matcher (the wrapper only needs *some* agent id to pick
+/// the per-agent key; if it's wrong, restore yields a miss and the
+/// raw token stays in place — that's safe-by-default).
+async fn resolve_agent_for_restore(ctx: &ReplyContext, session_id: &str) -> String {
+    if let Some(name) = get_default_agent(&ctx.home_dir).await {
+        return name;
+    }
+    let reg = ctx.registry.read().await;
+    if let Some(a) = reg.main_agent() {
+        return a.config.agent.name.clone();
+    }
+    // Last-ditch: session_id prefix.
+    session_id
+        .split(':')
+        .next()
+        .unwrap_or("default")
+        .to_string()
+}
+
+/// Build a reply with progress streaming.
+///
+/// `on_progress` callback receives real-time progress events (keepalive,
+/// tool-use details) that the channel handler can forward to the user.
+pub async fn build_reply_with_progress(
+    text: &str,
+    ctx: &ReplyContext,
+    on_progress: Option<ProgressCallback>,
+) -> String {
+    build_reply_with_session(text, ctx, "default", "anonymous", on_progress).await
+}
+
+/// Build a reply for a specific named agent (used by per-agent Discord bots).
+///
+/// Instead of reading `default_agent` from config.toml, this directly resolves
+/// the agent by `agent_name` in the registry.
+pub async fn build_reply_for_agent(
+    text: &str,
+    ctx: &ReplyContext,
+    agent_name: &str,
+    session_id: &str,
+    user_id: &str,
+    on_progress: Option<ProgressCallback>,
+) -> String {
+    let raw =
+        build_reply_with_session_inner(text, ctx, Some(agent_name), session_id, user_id, on_progress).await;
+    restore_for_channel(raw, ctx, agent_name, session_id).await
+}
+
+/// Build a reply with session tracking and optional progress streaming.
+///
+/// `user_id` should be the stable per-user identifier from the channel
+/// (e.g., Telegram chat_id, LINE sender ID, Discord user ID).
+/// This feeds the prediction engine's per-user statistical models.
+pub async fn build_reply_with_session(
+    text: &str,
+    ctx: &ReplyContext,
+    session_id: &str,
+    user_id: &str,
+    on_progress: Option<ProgressCallback>,
+) -> String {
+    let raw =
+        build_reply_with_session_inner(text, ctx, None, session_id, user_id, on_progress).await;
+    let agent_id = resolve_agent_for_restore(ctx, session_id).await;
+    restore_for_channel(raw, ctx, &agent_id, session_id).await
+}
+
+/// Inner implementation shared by both default-agent and explicit-agent paths.
+///
+/// When `agent_override` is `Some(name)`, the named agent is looked up directly.
+/// When `None`, the default agent resolution logic (config.toml → main_agent) is used.
+async fn build_reply_with_session_inner(
+    text: &str,
+    ctx: &ReplyContext,
+    agent_override: Option<&str>,
+    session_id: &str,
+    user_id: &str,
+    on_progress: Option<ProgressCallback>,
+) -> String {
+    // BLOCKER fix (review B1): use a fresh per-turn ID for citation tracking
+    // and prediction-error feedback. `session_id` spans many turns; sharing
+    // it as the citation key meant prior turns' citations were attributed
+    // to the next turn's prediction error. The session id is still used for
+    // session manager / metrics; only the trust feedback path switches.
+    let turn_id = format!("{session_id}#{}", uuid::Uuid::new_v4());
+
+    // Determine which agent to use
+    let reg = ctx.registry.read().await;
+    let agent = if let Some(name) = agent_override {
+        // Explicit agent name (per-agent Discord bot)
+        reg.get(name).or_else(|| reg.main_agent())
+    } else {
+        // Resolve via AgentResolver: trigger word → channel binding → default_agent → main_agent
+        let channel = session_id.split(':').next().unwrap_or("unknown").to_string();
+        let msg = Message {
+            id: String::new(),
+            message_type: MessageType::Incoming,
+            channel,
+            chat_id: session_id.to_string(),
+            sender: user_id.to_string(),
+            text: text.to_string(),
+            timestamp: chrono::Utc::now(),
+            agent_id: None,
+        };
+        let resolver = AgentResolver::new(&reg);
+        if let Some(resolved) = resolver.resolve(&msg) {
+            Some(resolved)
+        } else {
+            // Fallback: config.toml default_agent → main_agent()
+            let default_agent_name = get_default_agent(&ctx.home_dir).await;
+            if let Some(name) = &default_agent_name {
+                reg.get(name).or_else(|| reg.main_agent())
+            } else {
+                reg.main_agent()
+            }
+        }
+    };
+
+    if let Some(a) = agent {
+        info!("Using agent: {} ({})", a.config.agent.display_name, a.config.agent.name);
+    }
+
+    let model = agent
+        .map(|a| a.config.model.preferred.clone())
+        .unwrap_or_else(|| "claude-sonnet-4-20250514".to_string());
+
+    let agent_id = agent.map(|a| a.config.agent.name.clone()).unwrap_or_default();
+    let agent_dir = agent.map(|a| a.dir.clone());
+    let capabilities = agent.map(|a| a.config.capabilities.clone());
+    let skill_token_budget = agent
+        .map(|a| a.config.evolution.skill_token_budget)
+        .unwrap_or(2500);
+    let external_factors_config = agent
+        .map(|a| a.config.evolution.external_factors.clone())
+        .unwrap_or_default();
+
+    // Refresh compressed skill cache from agent's loaded skills
+    {
+        let skills_data: Vec<(String, String, Option<String>)> = agent
+            .map(|a| {
+                a.skills.iter().map(|s| {
+                    (s.name.clone(), s.content.clone(), None)
+                }).collect()
+            })
+            .unwrap_or_default();
+        let mut cache = ctx.skill_cache.lock().await;
+        cache.refresh(&skills_data);
+    }
+
+    // Get active skills for progressive injection
+    let active_skills = {
+        let ctrl = ctx.skill_activation.lock().await;
+        ctrl.get_active(&agent_id)
+    };
+
+    // Build sub-agent team roster for system prompt injection.
+    // Lists agents whose `reports_to` matches the current agent, so the agent
+    // knows its team and can delegate via `spawn_agent` / `send_to_agent`.
+    let team_members: Vec<TeamMember> = {
+        let agents = reg.list();
+        agents.iter()
+            .filter(|a| a.config.agent.reports_to == agent_id && a.config.agent.name != agent_id)
+            .map(|a| TeamMember {
+                name: a.config.agent.name.clone(),
+                display_name: a.config.agent.display_name.clone(),
+                role: format!("{:?}", a.config.agent.role),
+            })
+            .collect()
+    };
+    let team_ref = if team_members.is_empty() { None } else { Some(team_members.as_slice()) };
+
+    // RFC-21 §1 step 4: resolve the sender's canonical identity *once* per
+    // turn from the WikiCacheIdentityProvider (which becomes a Chained
+    // provider once Notion / LDAP land in step 3). The formatted block is
+    // injected into the system prompt — agents no longer need to grep
+    // `shared_wiki_read("identity/discord-users.md")` mid-reasoning.
+    let sender_block = build_sender_block(&ctx.home_dir, session_id, user_id).await;
+
+    // Build progressive system prompt
+    let system_prompt = {
+        let cache = ctx.skill_cache.lock().await;
+        let compressed: Vec<_> = cache.all().into_iter().cloned().collect();
+        // turn_id keys this turn's citations (drain unit); session_id is the
+        // budget unit for the per-conversation 0.10 cap. Both are needed —
+        // see review BLOCKER R2-1 (cap was silently broken when conv_cap PK
+        // followed turn_id and reset every turn).
+        let citation_ctx = Some((agent_id.as_str(), turn_id.as_str(), Some(session_id)));
+        if compressed.is_empty() {
+            build_system_prompt(
+                agent, None, None, None, skill_token_budget, team_ref, "", citation_ctx, &sender_block,
+            )
+        } else {
+            build_system_prompt(
+                agent,
+                Some(text),
+                Some(&compressed),
+                Some(&active_skills),
+                skill_token_budget,
+                team_ref,
+                "",
+                citation_ctx,
+                &sender_block,
+            )
+        }
+    };
+    drop(reg);
+
+    let session_mgr = &ctx.session_manager;
+
+    // ── L0: Safety word check (highest priority, zero latency) ──
+    // Runs BEFORE session creation to avoid unnecessary DB writes for !STOP etc.
+    let safety_action = duduclaw_security::safety_word::check(text, &ctx.killswitch.safety_words);
+    if !matches!(safety_action, duduclaw_security::safety_word::SafetyWordAction::None) {
+        // Safety words are handled by chat_commands.rs, but if we reach here
+        // (e.g., direct call without command parsing), handle inline
+        match &safety_action {
+            duduclaw_security::safety_word::SafetyWordAction::Stop(scope) => {
+                if let Some(ref failsafe) = ctx.failsafe {
+                    match scope {
+                        duduclaw_security::safety_word::SafetyWordScope::CurrentScope => {
+                            failsafe.force_halt(session_id, "safety word").await;
+                            duduclaw_security::audit::log_safety_word(
+                                &ctx.home_dir, &agent_id, session_id, user_id, "stop",
+                            );
+                            return duduclaw_security::safety_word::format_response(&safety_action, session_id);
+                        }
+                        duduclaw_security::safety_word::SafetyWordScope::Global => {
+                            // Global stop requires admin — this inline path has no
+                            // admin context, so only halt the current scope as a
+                            // safeguard. The full !STOP ALL is handled via
+                            // chat_commands::handle_command which enforces admin.
+                            warn!(session_id, user_id, "!STOP ALL via inline path — halting scope only (admin check unavailable)");
+                            failsafe.force_halt(session_id, "safety word: STOP ALL (scope-only)").await;
+                            duduclaw_security::audit::log_safety_word(
+                                &ctx.home_dir, &agent_id, session_id, user_id, "stop_all_downgraded",
+                            );
+                            return "🛑 Agent stopped (scope). Global stop requires admin — use chat command.".to_string();
+                        }
+                    }
+                }
+                return duduclaw_security::safety_word::format_response(&safety_action, session_id);
+            }
+            duduclaw_security::safety_word::SafetyWordAction::Resume => {
+                if let Some(ref failsafe) = ctx.failsafe {
+                    // Only resume the current scope — global halt requires
+                    // explicit !STOP ALL scope to be cleared separately (via
+                    // chat_commands handler which has user_id for admin check).
+                    failsafe.resume(session_id).await;
+                    duduclaw_security::audit::log_safety_word(
+                        &ctx.home_dir, &agent_id, session_id, user_id, "resume",
+                    );
+                    return duduclaw_security::safety_word::format_response(&safety_action, session_id);
+                }
+                return "⚠️ Failsafe system not initialized.".to_string();
+            }
+            duduclaw_security::safety_word::SafetyWordAction::Status => {
+                if let Some(ref failsafe) = ctx.failsafe {
+                    let state = failsafe.get_state(session_id).await;
+                    return duduclaw_security::failsafe::format_status(session_id, state.as_ref());
+                }
+                return "Failsafe: not initialized".to_string();
+            }
+            duduclaw_security::safety_word::SafetyWordAction::None => {}
+        }
+    }
+
+    // ── L1: Failsafe state gate ──
+    if let Some(ref failsafe) = ctx.failsafe {
+        // Check global halt first
+        let global_level = failsafe.get_level("__global__").await;
+        let scope_level = failsafe.get_level(session_id).await;
+        let effective_level = std::cmp::max(global_level, scope_level);
+
+        use duduclaw_security::failsafe::FailsafeLevel;
+        match effective_level {
+            FailsafeLevel::L4Halted => {
+                // Halted: reply with canned message
+                return failsafe.canned_reply(effective_level)
+                    .unwrap_or("Service paused.").to_string();
+            }
+            FailsafeLevel::L3Muted => {
+                // Muted: silent drop, no reply
+                return String::new();
+            }
+            FailsafeLevel::L2Restricted => {
+                // Restricted: return canned reply, don't call AI
+                return failsafe.canned_reply(effective_level)
+                    .unwrap_or("Service restricted.").to_string();
+            }
+            FailsafeLevel::L1Degraded => {
+                // Degraded: allow through but could prefer local model
+                // (model routing is handled downstream)
+            }
+            FailsafeLevel::L0Normal => {}
+        }
+    }
+
+    // ── L2: Circuit breaker check ──
+    let mut breaker_state = duduclaw_security::circuit_breaker::BreakerState::Closed;
+    if let Some(ref cb_registry) = ctx.circuit_breakers {
+        let decision = cb_registry.check_inbound(session_id, text).await;
+        match decision {
+            duduclaw_security::circuit_breaker::BreakerDecision::Allow => {}
+            duduclaw_security::circuit_breaker::BreakerDecision::Throttle => {
+                breaker_state = duduclaw_security::circuit_breaker::BreakerState::HalfOpen;
+                // Allow through but mark for defensive prompt injection later
+            }
+            duduclaw_security::circuit_breaker::BreakerDecision::Deny(_) => {
+                debug!(session_id, "Circuit breaker denied — message dropped");
+                return String::new(); // silent drop
+            }
+            duduclaw_security::circuit_breaker::BreakerDecision::Trip(reason) => {
+                warn!(session_id, reason = %reason, "Circuit breaker tripped");
+                // Audit log
+                duduclaw_security::audit::log_circuit_breaker_trip(
+                    &ctx.home_dir, &agent_id, session_id, &reason.to_string(),
+                );
+                // Escalate failsafe
+                if let Some(ref failsafe) = ctx.failsafe {
+                    failsafe.escalate(session_id, &format!("circuit breaker: {reason}")).await;
+                }
+                return String::new(); // silent drop for this message
+            }
+        }
+    }
+
+    // ── L3: Prompt injection scan (existing) ──
+    let scan = duduclaw_security::input_guard::scan_input(
+        text,
+        duduclaw_security::input_guard::DEFAULT_BLOCK_THRESHOLD,
+    );
+    if scan.blocked {
+        warn!(
+            agent = %agent_id,
+            score = scan.risk_score,
+            rules = ?scan.matched_rules,
+            "Prompt injection detected — blocking message"
+        );
+        return format!("⚠️ {}", scan.summary);
+    }
+
+    // ── All pre-filters passed — now create/load session ──
+    let _ = session_mgr.get_or_create(session_id, &agent_id).await;
+
+    // ── Phase 3: Check if previous trajectory should get feedback ──
+    // The current user message may contain feedback (positive/negative) for
+    // the assistant's previous reply, completing the "within 2 turns" window.
+    {
+        let sentiment = detect_user_sentiment(text);
+        if let Some(sentiment) = sentiment {
+            let session_key = format!("{session_id}:{agent_id}");
+            let mut recorder = ctx.skill_recorder.lock().await;
+            if recorder.is_recording(&session_key) {
+                // Record this feedback turn, then finalize with detected sentiment
+                recorder.record_turn(&session_key, "user", text, vec![]);
+                let outcome = match sentiment {
+                    Sentiment::Positive => TrajectoryOutcome::Success,
+                    Sentiment::Negative => TrajectoryOutcome::Failure,
+                };
+                if let Some(trajectory) = recorder.finalize(&session_key, outcome, Some(sentiment)) {
+                    // Extract skill heuristically (zero LLM cost)
+                    if let Some(skill) = SkillExtractor::extract_heuristic(&trajectory) {
+                        info!(
+                            skill_name = %skill.name,
+                            tools = ?skill.tools_used,
+                            confidence = skill.confidence,
+                            "Auto-extracted skill from trajectory (feedback-triggered)"
+                        );
+
+                        // Persist to SkillCache
+                        {
+                            let mut bank = ctx.skill_bank.lock().await;
+                            bank.add(skill.clone());
+                            debug!(bank_size = bank.len(), "Skill added to SkillCache");
+                        }
+
+                        // Log extraction event to audit log
+                        let audit_entry = serde_json::json!({
+                            "event": "skill_extracted",
+                            "trigger": "user_feedback",
+                            "skill_id": skill.id,
+                            "skill_name": skill.name,
+                            "tools_used": skill.tools_used,
+                            "confidence": skill.confidence,
+                            "sentiment": format!("{sentiment:?}"),
+                            "source_session": session_key,
+                            "timestamp": chrono::Utc::now().to_rfc3339(),
+                        });
+                        if let Ok(audit_line) = serde_json::to_string(&audit_entry) {
+                            let audit_path = ctx.home_dir.join("skill_extraction_audit.jsonl");
+                            if let Ok(mut f) = tokio::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(&audit_path)
+                                .await
+                            {
+                                use tokio::io::AsyncWriteExt;
+                                let _ = f.write_all(format!("{audit_line}\n").as_bytes()).await;
+                            }
+                        }
+                    }
+                }
+                debug!(
+                    session = %session_key,
+                    sentiment = ?sentiment,
+                    "User feedback detected for active trajectory"
+                );
+            }
+        }
+    }
+
+    // Sanitize role-prefix injection: strip any attempt to impersonate assistant/system role
+    let sanitized_text = if text.starts_with("assistant:") || text.starts_with("system:") {
+        format!("[user input] {text}")
+    } else {
+        text.to_string()
+    };
+
+    // Prepend sender metadata so the agent can identify who is talking
+    let sanitized_text = if user_id != "anonymous" && !user_id.is_empty() {
+        format!("[sender_id: {user_id}]\n{sanitized_text}")
+    } else {
+        sanitized_text
+    };
+
+    // Append user message to session using improved CJK-aware token estimate
+    let user_tokens = estimate_tokens(&sanitized_text);
+    if let Err(e) = session_mgr
+        .append_message(session_id, "user", &sanitized_text, user_tokens)
+        .await
+    {
+        warn!("Failed to save user message to session: {e}");
+    }
+
+    // Build structured conversation history from session (for native multi-turn).
+    // Filter out "system" role messages — these are post-compression summaries
+    // stored by SessionManager::compress(). They belong in the system prompt,
+    // not in the conversation turns (Anthropic Messages API rejects them).
+    //
+    // #13 glue (2026-05-12): when the async summarizer task has folded
+    // older turns into `summary_of_prior`, prepend the summary as a
+    // synthetic `assistant` recap turn and skip the verbatim slice it
+    // covers. Falls through to verbatim history when no summary exists
+    // (summarizer hasn't run yet, or session is below the threshold).
+    let max_history_turns = 20;
+    let mut compression_summary = String::new();
+    let (async_summary, summarized_through) = session_mgr
+        .get_summary(session_id)
+        .await
+        .unwrap_or_default();
+    let conversation_history: Vec<ConversationTurn> = match session_mgr.get_messages(session_id).await {
+        Ok(msgs) => {
+            // Optional prefix when the summarizer task has run for this
+            // session. Encoded as a single assistant-role turn so the
+            // Messages API doesn't reject it (no `system` role in turns).
+            let mut out: Vec<ConversationTurn> = Vec::new();
+            if !async_summary.trim().is_empty() {
+                out.push(ConversationTurn {
+                    role: "assistant".to_string(),
+                    content: format!(
+                        "[summary of earlier turns 1..={summarized_through}]\n{async_summary}"
+                    ),
+                });
+            }
+
+            // Verbatim slice: skip the first `summarized_through` turns
+            // (already captured in the prefix) and the LAST turn (which
+            // is the user message about to be re-sent below). The +1
+            // index skip is intentional — we want messages.len() - 1
+            // minus the summarized prefix.
+            let summarized_through_usize = summarized_through as usize;
+            let prior_full: Vec<_> = msgs.iter()
+                .take(msgs.len().saturating_sub(1))
+                .filter_map(|m| {
+                    if m.role == "system" {
+                        // Capture compression summary for system prompt injection
+                        if !m.content.is_empty() {
+                            compression_summary = m.content.clone();
+                        }
+                        None
+                    } else {
+                        Some(ConversationTurn {
+                            role: m.role.clone(),
+                            content: m.content.clone(),
+                        })
+                    }
+                })
+                .collect();
+            // Trim already-summarized turns (best-effort: the count we
+            // skip is approximate because the summarizer indexes raw
+            // messages, including potential hidden ones — but trimming
+            // a bit conservatively is fine, the model sees the summary
+            // either way).
+            let prior: Vec<_> = if summarized_through_usize > 0
+                && prior_full.len() > summarized_through_usize
+            {
+                prior_full[summarized_through_usize..].to_vec()
+            } else if summarized_through_usize >= prior_full.len() {
+                Vec::new()
+            } else {
+                prior_full
+            };
+
+            // Keep only the most recent turns to prevent token overflow
+            let trimmed = if prior.len() > max_history_turns {
+                prior[prior.len() - max_history_turns..].to_vec()
+            } else {
+                prior
+            };
+            out.extend(trimmed);
+            out
+        }
+        Err(e) => {
+            warn!("Failed to load session messages: {e}");
+            vec![]
+        }
+    };
+    let has_history = !conversation_history.is_empty();
+
+    // ── Instruction Pinning: load + accumulate ──
+    // Pinned instructions survive session compression (stored on sessions table).
+    let mut pinned = session_mgr.get_pinned(session_id).await.unwrap_or_default();
+
+    // Clarification accumulation: if agent asked a question last turn and user
+    // is now answering, append the answer to pinned instructions.
+    if has_history && !pinned.is_empty() {
+        if let Some(last_assistant) = conversation_history.iter().rev()
+            .find(|t| t.role == "assistant")
+        {
+            if last_assistant.content.contains('？') || last_assistant.content.contains('?') {
+                let answer_snippet = duduclaw_core::truncate_bytes(&sanitized_text, 200);
+                // Cap pinned at ~1000 chars to prevent bloat
+                if pinned.len() < 1000 {
+                    pinned = format!("{pinned}\n- 用戶確認：{answer_snippet}");
+                    let _ = session_mgr.set_pinned(session_id, &pinned).await;
+                }
+            }
+        }
+    }
+
+    // Inject key facts + pinned instructions + compression summary into system prompt.
+    // Order: key facts (middle) → compression summary → pinned (tail, highest attention).
+    let full_system_prompt = {
+        let mut prompt = system_prompt;
+
+        // P2 Key-Fact Accumulator: inject cross-session facts (middle position —
+        // stable reference data that doesn't need U-shaped peak attention).
+        // Uses spawn_blocking because SqliteMemoryEngine is !Send (rusqlite).
+        if let Some(db_path) = ctx.memory_db_path.clone() {
+            let aid = agent_id.clone();
+            let query = sanitized_text.clone();
+            if let Ok(facts_text) = tokio::task::spawn_blocking(move || {
+                let engine = duduclaw_memory::SqliteMemoryEngine::new(&db_path).ok()?;
+                let rt = tokio::runtime::Handle::current();
+                let facts = rt.block_on(engine.search_facts(&aid, &query, 3)).ok()?;
+                if facts.is_empty() { return None; }
+                Some(facts.iter().map(|f| format!("- {}", f.fact)).collect::<Vec<_>>().join("\n"))
+            }).await {
+                if let Some(ft) = facts_text {
+                    prompt = format!("{prompt}\n\n## Key Facts About This User\n{ft}");
+                }
+            }
+        }
+
+        // F2a (Reflexion recall): surface this agent's recent unresolved mistakes
+        // into the answering prompt — not just the GVU Generator (SOUL.md path).
+        // Bridges MistakeNotebook → cross-task learning so the agent avoids
+        // repeating past failures on similar topics.
+        if let Some(ref nb) = ctx.mistake_notebook {
+            // Topic-scoped recall first (whitespace keywords); fall back to most
+            // recent unresolved so CJK queries (no whitespace tokens) aren't empty.
+            let kw: Vec<&str> = sanitized_text
+                .split_whitespace()
+                .filter(|w| w.chars().count() >= 3)
+                .take(12)
+                .collect();
+            let mut mistakes = if kw.is_empty() {
+                nb.query_by_agent(&agent_id, 3)
+            } else {
+                nb.query_by_topic(&kw, &agent_id, 3)
+            };
+            if mistakes.is_empty() {
+                mistakes = nb.query_by_agent(&agent_id, 3);
+            }
+            if !mistakes.is_empty() {
+                let section = mistakes
+                    .iter()
+                    .map(|m| m.to_prompt_section())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                prompt = format!("{prompt}\n\n## Past Mistakes to Avoid\n{section}");
+            }
+        }
+
+        if !compression_summary.is_empty() {
+            prompt = format!("{prompt}\n\n## Prior Conversation Summary\n{compression_summary}");
+        }
+        if !pinned.is_empty() {
+            prompt = format!(
+                "{prompt}\n\n## Pinned Task Instructions\n\
+                 The user's core task requirements (ALWAYS follow these throughout the conversation):\n\
+                 {pinned}"
+            );
+        }
+        prompt
+    };
+
+    // Track the last underlying failure so the fallback message can
+    // accurately describe what went wrong (rate limit vs timeout vs
+    // missing binary etc.) instead of always blaming "not installed".
+    let mut last_cli_error: Option<String> = None;
+
+    // Record the moment we dispatched the CLI call. This is the lower
+    // time bound used by the action-claim verifier when scanning
+    // tool_calls.jsonl for receipts that back up the agent's text
+    // assertions — anything before this timestamp belongs to a
+    // previous turn and must not be credited to this one.
+    let dispatch_start_time = chrono::Utc::now().to_rfc3339();
+
+    // ── L5 Computer Use: intercept if agent has computer_use enabled ──
+    // Check for natural-language emergency stop first
+    if crate::risk_detector::is_emergency_stop(text) {
+        info!(session_id, "Emergency stop detected for computer use");
+        // Stop ALL active computer use sessions via the global registry
+        let sessions = crate::computer_use_orchestrator::list_sessions().await;
+        for sid in &sessions {
+            if let Some(ctl) = crate::computer_use_orchestrator::get_session_control(sid).await {
+                ctl.stopped.store(true, std::sync::atomic::Ordering::Release);
+            }
+            crate::computer_use_orchestrator::unregister_session(sid).await;
+        }
+        let count = sessions.len();
+        return if count > 0 {
+            format!("🛑 已停止 {count} 個電腦操作 session")
+        } else {
+            "🛑 已停止電腦操作".to_string()
+        };
+    }
+
+    // Check if this agent has computer_use enabled and the user's intent
+    // suggests a computer use task (e.g., mentions screen, click, open app).
+    let cu_enabled = capabilities
+        .as_ref()
+        .map(|c| c.computer_use)
+        .unwrap_or(false);
+
+    if cu_enabled && looks_like_computer_use_request(text) {
+        // Build a ComputerUseConfig from the agent's capabilities
+        let cap_cfg = capabilities
+            .as_ref()
+            .map(|c| &c.computer_use_config)
+            .cloned()
+            .unwrap_or_default();
+        // Read execution_mode from capabilities
+        let exec_mode = capabilities
+            .as_ref()
+            .map(|c| c.computer_use_mode)
+            .unwrap_or_default();
+
+        // Read CONTRACT.toml must_not rules (if the agent has a contract)
+        let contract_must_not = agent_dir.as_ref().and_then(|d| {
+            let contract_path = d.join("CONTRACT.toml");
+            let content = std::fs::read_to_string(&contract_path).ok()?;
+            let table: toml::Table = content.parse().ok()?;
+            let must_not = table.get("must_not")?.as_table()?;
+            let rules = must_not.get("rules")?.as_array()?;
+            Some(rules.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect::<Vec<_>>())
+        }).unwrap_or_default();
+
+        let cu_config = crate::computer_use_orchestrator::ComputerUseConfig {
+            max_session_minutes: cap_cfg.max_session_minutes,
+            max_actions: cap_cfg.max_actions,
+            display_width: cap_cfg.display_width,
+            display_height: cap_cfg.display_height,
+            auto_confirm_trusted: cap_cfg.auto_confirm_trusted,
+            allowed_apps: cap_cfg.allowed_apps.clone(),
+            blocked_actions: cap_cfg.blocked_actions.clone(),
+            execution_mode: exec_mode,
+            contract_must_not,
+            ..Default::default()
+        };
+
+        // Resolve API key for the Claude Vision API (computer use needs direct API)
+        if let Some(api_key) = get_api_key(&ctx.home_dir).await {
+            let mut orchestrator = crate::computer_use_orchestrator::ComputerUseOrchestrator::new(
+                agent_id.clone(),
+                ctx.home_dir.clone(),
+                cu_config,
+            );
+
+            // Build a real channel sender from the session_id (e.g., "telegram:12345")
+            // so screenshots and confirmations are delivered to the user's channel.
+            let sender: Box<dyn crate::channel_sender::ChannelSender> = {
+                let (ch_type, ch_id) = parse_session_id_parts(session_id);
+                if ch_type.is_empty() || ch_id.is_empty() {
+                    Box::new(crate::channel_sender::NullSender)
+                } else if ch_type == "webchat" {
+                    // WebChat needs the broadcast tx for WebSocket delivery
+                    crate::channel_sender::create_webchat_sender(
+                        ch_id.to_string(),
+                        ctx.event_tx.clone(),
+                    )
+                } else {
+                    // Look up the channel token from config
+                    let token = crate::config_crypto::read_encrypted_config_field(
+                        &ctx.home_dir, ch_type, &format!("{ch_type}_bot_token"),
+                    ).await.unwrap_or_default();
+
+                    let target = crate::channel_sender::ChannelTarget {
+                        channel_type: ch_type.to_string(),
+                        chat_id: ch_id.to_string(),
+                        token,
+                        extra_id: Some(user_id.to_string()),
+                    };
+                    crate::channel_sender::create_sender(&target, ctx.http.clone())
+                }
+            };
+
+            // Generate a session ID and register in the global registry
+            let cu_session_id = format!("cu-{}", uuid::Uuid::new_v4().as_simple());
+            let control = orchestrator.control_handle();
+
+            match orchestrator.start_session(&api_key, &model).await {
+                Ok(()) => {
+                    // Register session so /stop, emergency stop, and MCP tools can find it
+                    if let Err(e) = crate::computer_use_orchestrator::register_session(
+                        &cu_session_id, control,
+                    ).await {
+                        warn!(error = %e, "Failed to register computer use session");
+                        orchestrator.stop_session().await;
+                        // Fall through to text reply
+                    } else {
+                        let result = orchestrator.run_loop(text, sender.as_ref()).await;
+
+                        // Always unregister on completion
+                        crate::computer_use_orchestrator::unregister_session(&cu_session_id).await;
+
+                        match result {
+                            Ok(reply_text) => return reply_text,
+                            Err(e) => {
+                                warn!(error = %e, "Computer use session failed, falling back to text");
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "Failed to start computer use container, falling back to text");
+                }
+            }
+        }
+    }
+
+    // 1. Try `claude` CLI with multi-account rotation (OAuth + API keys)
+    // Wrap in REPLY_CHANNEL scope so `send_to_agent` MCP tool can register
+    // delegation callbacks for sub-agent response forwarding.
+    // Only set for sessions originating from a real channel (telegram/line/discord).
+    // Snowball Recap: prepend pinned instructions as <task_recap> to user message.
+    // Placed in user message (U-shaped attention tail peak) rather than system
+    // prompt to maximize LLM attention on the original task requirements.
+    let effective_message = if pinned.is_empty() || !has_history {
+        sanitized_text.clone()
+    } else {
+        format!("<task_recap>\n{pinned}\n</task_recap>\n\n{sanitized_text}")
+    };
+
+    // #12 glue (2026-05-12) — request-boundary budget enforcement.
+    //
+    // Read the agent's `[budget] max_input_tokens` (0 = disabled,
+    // back-compat). If the total estimated prompt is over budget, run
+    // the compression pipeline on `conversation_history`. The
+    // `cost_pressure` flag from #6.3 makes early stages more aggressive.
+    //
+    // Failure mode is intentionally NON-fatal: if the pipeline can't
+    // bring us under budget, we log a warn + emit an evolution event
+    // and proceed with the full history. Rejecting the request would
+    // surprise the user with a silent failure mid-conversation; the
+    // 200 K cliff merely doubles input price, it doesn't break the
+    // call. Future work can flip this to hard-reject behind a flag.
+    let conversation_history = maybe_compress_history(
+        &full_system_prompt,
+        conversation_history,
+        &effective_message,
+        &agent_id,
+    );
+
+    // Phase 3.C.4 (2026-05-14) — interactive PTY routing for OAuth.
+    //
+    // When `agent.toml [runtime] pty_pool_enabled = true`, route through
+    // the PTY-backed pipeline:
+    //   - OAuth accounts → interactive REPL via `PtySession`
+    //     (Phase 3.C.2 implementation; works after Anthropic's `claude -p`
+    //      OAuth block).
+    //   - API-key accounts → PTY-wrapped `claude -p` (Phase 3.B fallback).
+    //   - Auth-method branching happens inside `call_claude_cli_pty_rotated`
+    //     based on the rotator's `env_vars` shape (Phase 3.C.4).
+    //
+    // Default (`pty_pool_enabled = false`) keeps the legacy
+    // `tokio::process::Command + claude -p` path. Toggle is per-agent
+    // for safe gradual rollout.
+    let runtime_mode = agent_dir
+        .as_deref()
+        .map(crate::pty_runtime::runtime_mode_for_agent)
+        .unwrap_or(crate::pty_runtime::RuntimeMode::FreshSpawn);
+    if runtime_mode == crate::pty_runtime::RuntimeMode::PtyPool {
+        info!(
+            agent_id = %agent_id,
+            mode = runtime_mode.as_str(),
+            "channel_reply: routing through PTY pool (OAuth → interactive, API-key → -p)"
+        );
+    }
+
+    // RFC-25 Phase 1: provider-agnostic routing. When the agent's
+    // `[runtime] provider` is not Claude, route the whole reply through the
+    // multi-runtime choke-point (Codex / Gemini / OpenAI-compat). Claude keeps
+    // its optimized OAuth-rotation + PTY path below (unchanged, zero regression).
+    let runtime_provider = agent_dir
+        .as_deref()
+        .map(crate::runtime_config::agent_runtime_provider)
+        .unwrap_or_default();
+
+    let cli_future: std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<String, String>> + Send + '_>,
+    > = if runtime_provider != duduclaw_core::types::RuntimeType::Claude {
+        info!(
+            agent_id = %agent_id,
+            provider = runtime_provider.as_str(),
+            "channel_reply: routing through multi-runtime choke-point (non-Claude provider)"
+        );
+        Box::pin(crate::runtime_dispatch::run_agent_prompt_text(
+            crate::runtime_dispatch::AgentPrompt {
+                agent_dir: agent_dir.as_deref(),
+                home_dir: &ctx.home_dir,
+                agent_id: &agent_id,
+                prompt: &effective_message,
+                system_prompt: &full_system_prompt,
+                model: &model,
+                max_tokens: 8192,
+            },
+        ))
+    } else {
+        match runtime_mode {
+            crate::pty_runtime::RuntimeMode::PtyPool => Box::pin(call_claude_cli_pty_rotated(
+                &effective_message,
+                &model,
+                &full_system_prompt,
+                &ctx.home_dir,
+                agent_dir.as_deref(),
+                on_progress.as_ref(),
+                capabilities.as_ref(),
+                if has_history { Some(session_id) } else { None },
+                &conversation_history,
+            )),
+            crate::pty_runtime::RuntimeMode::FreshSpawn => Box::pin(call_claude_cli_rotated(
+                &effective_message,
+                &model,
+                &full_system_prompt,
+                &ctx.home_dir,
+                agent_dir.as_deref(),
+                on_progress.as_ref(),
+                capabilities.as_ref(),
+                if has_history { Some(session_id) } else { None },
+                &conversation_history,
+            )),
+        }
+    };
+    let is_channel_session = duduclaw_core::SUPPORTED_CHANNEL_TYPES.iter()
+        .any(|t| session_id.starts_with(&format!("{t}:")));
+    // (review B2) Make `turn_id` and `session_id` available to sub-agent
+    // dispatchers via tokio task-locals. Any wiki RAG triggered by the
+    // dispatcher inherits these so citations land in the right tracker
+    // bucket AND respect the session-scoped per-conv cap.
+    let cli_future = duduclaw_memory::feedback::CURRENT_SESSION_ID
+        .scope(Some(session_id.to_string()), cli_future);
+    let cli_future = duduclaw_memory::feedback::CURRENT_TURN_ID
+        .scope(Some(turn_id.clone()), cli_future);
+    // RFC-22 P1-7: scope CHANNEL_REPLY_AGENT_ID so spawn_claude_cli_with_env
+    // can record cost_telemetry against the correct agent. agent_id is empty
+    // when no agent resolved — scope an empty string in that case; the spawn
+    // path checks for non-empty before calling cost_telemetry.
+    let cli_future = crate::claude_runner::CHANNEL_REPLY_AGENT_ID
+        .scope(agent_id.clone(), cli_future);
+    let reply = if is_channel_session {
+        crate::claude_runner::REPLY_CHANNEL.scope(session_id.to_string(), cli_future).await
+    } else {
+        cli_future.await
+    };
+    let reply = match reply {
+        Ok(reply) => {
+            info!("Claude replied via Claude Code SDK ({} chars)", reply.len());
+            Some(reply)
+        }
+        Err(e) => {
+            let log_line = format!("[{}] claude CLI error: {e}\n", chrono::Utc::now());
+            let _ = tokio::fs::OpenOptions::new()
+                .create(true).append(true)
+                .open(ctx.home_dir.join("debug.log")).await
+                .map(|mut f| { use tokio::io::AsyncWriteExt; tokio::spawn(async move { let _ = f.write_all(log_line.as_bytes()).await; }); });
+            warn!("claude CLI unavailable: {e}");
+            last_cli_error = Some(e);
+            None
+        }
+    };
+
+    // 2. Fallback: Local model inference (if configured)
+    let reply = match reply {
+        Some(r) => Some(r),
+        None => {
+            // Resolve agent's local model config (if any)
+            let local_model_id = agent_dir.as_ref().and_then(|d| {
+                let toml_path = d.join("agent.toml");
+                let content = std::fs::read_to_string(&toml_path).ok()?;
+                let table: toml::Table = content.parse().ok()?;
+                table.get("model")?.as_table()?
+                    .get("local")?.as_table()?
+                    .get("model")?.as_str().map(|s| s.to_string())
+            });
+            match crate::claude_runner::try_local_inference(
+                &ctx.home_dir, &sanitized_text, &full_system_prompt, local_model_id.as_deref(),
+            ).await {
+                Ok(local_reply) => {
+                    info!("Replied via local model ({} chars)", local_reply.len());
+                    // Prepend a notice so the user knows CLI failed and local model is answering
+                    let cli_err = last_cli_error.as_deref().unwrap_or("unknown");
+                    let hint = classify_cli_error_hint(cli_err);
+                    let notice = format!(
+                        "⚠️ Claude CLI 暫時不可用（{hint}），本次由本地模型代為回應。\n\
+                         系統會在背景自動偵測恢復。\n\n"
+                    );
+                    Some(format!("{notice}{local_reply}"))
+                }
+                Err(e) => {
+                    if e != "ROUTER_ESCALATE_TO_CLOUD" {
+                        warn!("Local inference unavailable: {e}");
+                    }
+                    None
+                }
+            }
+        }
+    };
+
+    // 3. Fallback: Python wrapper (with account rotator)
+    //
+    // The Python SDK uses the `anthropic` package (Direct API) which requires
+    // an API key — OAuth tokens are not supported. Only attempt this fallback
+    // when an API key is available; skip entirely for OAuth-only setups to
+    // avoid the misleading "未設定任何 API 帳號" error message.
+    let fallback_api_key = get_api_key(&ctx.home_dir).await;
+    let reply = match reply {
+        Some(r) => Some(r),
+        None if fallback_api_key.is_some() => {
+            match call_python_sdk_v2(
+                &sanitized_text, &model, &full_system_prompt, &ctx.home_dir,
+                fallback_api_key.as_deref(),
+            ).await {
+                Ok(reply) => {
+                    info!("Claude replied via Python SDK ({} chars)", reply.len());
+                    Some(reply)
+                }
+                Err(e) => {
+                    let log_line = format!("[{}] python SDK error: {e}\n", chrono::Utc::now());
+                    let _ = tokio::fs::OpenOptions::new()
+                        .create(true).append(true)
+                        .open(ctx.home_dir.join("debug.log")).await
+                        .map(|mut f| { use tokio::io::AsyncWriteExt; tokio::spawn(async move { let _ = f.write_all(log_line.as_bytes()).await; }); });
+                    warn!("Python SDK unavailable: {e}");
+                    // Only overwrite if we don't already have a more specific CLI error.
+                    if last_cli_error.is_none() {
+                        last_cli_error = Some(e);
+                    }
+                    None
+                }
+            }
+        }
+        None => {
+            info!("Skipping Python SDK fallback — no API key available (OAuth-only setup)");
+            None
+        }
+    };
+
+    if let Some(mut reply) = reply {
+        // ── Action-claim verifier (shadow mode) ─────────────────────
+        //
+        // Cross-reference factual assertions in `reply` against the
+        // MCP tool-call audit trail (`tool_calls.jsonl`) that was
+        // populated during this turn. Catches "Agnes-class" bugs where
+        // the agent narrates having done something (created 12 agents,
+        // sent a message, updated a SOUL file) without actually calling
+        // the corresponding MCP tool.
+        //
+        // Currently runs in SHADOW MODE: detections are logged to the
+        // security audit log and emitted as tracing events, but the
+        // reply is NOT altered. This lets us gather a `ungrounded_claim_rate`
+        // baseline before flipping to enforce mode.
+        //
+        // Zero LLM cost — pure regex + log diff.
+        // Zero marginal latency — runs on a value we already have.
+        if !agent_id.is_empty() {
+            let hallucinations = duduclaw_security::action_claim_verifier::detect_hallucinations(
+                &ctx.home_dir,
+                &agent_id,
+                &reply,
+                &dispatch_start_time,
+            );
+            if !hallucinations.is_empty() {
+                warn!(
+                    agent = %agent_id,
+                    session_id,
+                    count = hallucinations.len(),
+                    "🚨 Action-claim verifier flagged {} ungrounded claim(s) in reply (shadow mode — not blocking)",
+                    hallucinations.len()
+                );
+                for h in &hallucinations {
+                    if let duduclaw_security::action_claim_verifier::VerifyResult::Hallucination {
+                        claim,
+                        reason,
+                    } = h
+                    {
+                        warn!(
+                            agent = %agent_id,
+                            claim_type = ?claim.claim_type,
+                            target = %claim.target_id,
+                            matched_text = %claim.matched_text,
+                            reason = %reason,
+                            "ungrounded claim"
+                        );
+                        // Append a structured entry to security_audit.jsonl
+                        // so dashboards and forensic tooling can surface
+                        // the event. One row per claim.
+                        duduclaw_security::audit::log_tool_hallucination(
+                            &ctx.home_dir,
+                            &agent_id,
+                            &claim.matched_text,
+                            claim.claim_type.expected_tool(),
+                        );
+                    }
+                }
+            }
+        }
+
+        // Record outbound for circuit breaker echo detection
+        let reply_tokens = estimate_tokens(&reply);
+        if let Some(ref cb_registry) = ctx.circuit_breakers {
+            cb_registry.record_outbound(session_id, &reply, reply_tokens as usize).await;
+        }
+
+        // Inject defensive prompt if circuit breaker is in HalfOpen (bot loop suspected)
+        if crate::defensive_prompt::should_inject(breaker_state)
+            && ctx.killswitch.defensive_prompt.enabled
+        {
+            // Extract channel type from session_id (e.g. "telegram:123" → "telegram")
+            let channel_type = session_id.split(':').next().unwrap_or("unknown");
+            reply = crate::defensive_prompt::inject_defensive_prompt(
+                &reply,
+                &ctx.killswitch.defensive_prompt.languages,
+                channel_type,
+            );
+            debug!(session_id, "Defensive prompt injected (circuit breaker HalfOpen)");
+        }
+
+        // Save assistant reply to session
+        if let Err(e) = session_mgr
+            .append_message(session_id, "assistant", &reply, reply_tokens)
+            .await
+        {
+            warn!("Failed to save assistant message to session: {e}");
+        }
+
+        // ── RL trajectory collection (async, non-blocking) ─────────
+        // Collect session as an RL training trajectory after each reply.
+        // Runs in a background task to avoid adding latency to the hot path.
+        {
+            let home_for_rl = ctx.home_dir.clone();
+            let sid_for_rl = session_id.to_string();
+            let agent_for_rl = agent_id.clone();
+            let model_for_rl = model.clone();
+            let sm_for_rl = ctx.session_manager.clone();
+            tokio::spawn(async move {
+                let msgs = match sm_for_rl.get_messages(&sid_for_rl).await {
+                    Ok(m) if !m.is_empty() => m,
+                    Ok(_) => return,
+                    Err(e) => {
+                        tracing::debug!(error = %e, "RL collector: skip — cannot read session");
+                        return;
+                    }
+                };
+                let message_pairs: Vec<(String, String)> = msgs
+                    .iter()
+                    .map(|m| (m.role.clone(), m.content.clone()))
+                    .collect();
+                // Outcome reward: 1.0 for successful reply (we reached this code path)
+                crate::rl::collector::collect_trajectory(
+                    home_for_rl,
+                    sid_for_rl,
+                    agent_for_rl,
+                    model_for_rl,
+                    message_pairs,
+                    1.0,
+                )
+                .await;
+            });
+        }
+
+        // ── Instruction Pinning: extract on first turn ──────────────
+        // Asynchronously extract core task instructions from the first user
+        // message using Haiku (lightweight, same path as session compression).
+        // Pinned instructions persist across turns and survive compression.
+        if !has_history {
+            let sm = ctx.session_manager.clone();
+            let sid = session_id.to_string();
+            let user_text = sanitized_text.clone();
+            let home = ctx.home_dir.clone();
+            tokio::spawn(async move {
+                let prompt = format!(
+                    "Extract the core task instructions from this user message. \
+                     Output a concise bullet list of: goals, constraints, parameters, \
+                     and deliverables. Max 200 words. Use the same language as the input.\n\n\
+                     {user_text}"
+                );
+                match call_claude_cli_lightweight(
+                    &prompt, crate::runtime_config::DEFAULT_UTILITY_MODEL, &home,
+                ).await {
+                    Ok(extracted) => {
+                        if let Err(e) = sm.set_pinned(&sid, &extracted).await {
+                            warn!(session_id = %sid, error = %e, "Failed to save pinned instructions");
+                        } else {
+                            info!(session_id = %sid, "Pinned task instructions extracted ({} chars)", extracted.len());
+                        }
+                    }
+                    Err(e) => {
+                        warn!(session_id = %sid, error = %e, "Instruction extraction failed (best-effort, non-blocking)");
+                    }
+                }
+            });
+        }
+
+        // ── P2 Key-Fact Accumulator: extract facts from substantive turns ──
+        // Only extracts when reply is long enough to contain useful information.
+        // Async, non-blocking — same pattern as instruction extraction.
+        if reply.len() > 100 {
+            if let Some(db_path) = ctx.memory_db_path.clone() {
+                let agent_id_for_facts = agent_id.clone();
+                let user_text_for_facts = sanitized_text.clone();
+                let reply_snippet = duduclaw_core::truncate_bytes(&reply, 500).to_string();
+                let (ch, cid) = parse_session_id_parts(session_id);
+                let channel_for_facts = ch.to_string();
+                let chat_id_for_facts = cid.to_string();
+                let session_for_facts = session_id.to_string();
+                let home_for_facts = ctx.home_dir.clone();
+                tokio::spawn(async move {
+                    let prompt = format!(
+                        "Extract 2-4 key factual insights from this conversation turn \
+                         that would be useful in FUTURE conversations with this user. \
+                         Focus on: user preferences, confirmed decisions, domain rules, \
+                         technical constraints. Output bullet points only. Max 100 words. \
+                         Same language as input.\n\n\
+                         User: {user_text_for_facts}\n\
+                         Assistant: {reply_snippet}"
+                    );
+                    let facts_text = match call_claude_cli_lightweight(
+                        &prompt, crate::runtime_config::DEFAULT_UTILITY_MODEL, &home_for_facts,
+                    ).await {
+                        Ok(t) => t,
+                        Err(e) => {
+                            warn!(agent = %agent_id_for_facts, error = %e, "Key-fact extraction failed (best-effort)");
+                            return;
+                        }
+                    };
+
+                    // Store facts in spawn_blocking (SqliteMemoryEngine is !Send)
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let engine = match duduclaw_memory::SqliteMemoryEngine::new(&db_path) {
+                            Ok(e) => e,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "Failed to open memory engine for fact storage");
+                                return;
+                            }
+                        };
+                        let rt = tokio::runtime::Handle::current();
+                        for line in facts_text.lines() {
+                            let fact = line.trim_start_matches(&['-', '•', '*', ' '][..]).trim();
+                            if fact.len() < 10 { continue; }
+                            // Dedup: check if similar fact already exists
+                            if let Ok(existing) = rt.block_on(engine.search_facts(&agent_id_for_facts, fact, 1)) {
+                                if existing.first().map_or(false, |e| duduclaw_memory::word_jaccard(&e.fact, fact) > 0.8) {
+                                    let _ = rt.block_on(engine.bump_fact_access(&existing[0].id));
+                                    continue;
+                                }
+                            }
+                            let _ = rt.block_on(engine.store_fact(
+                                &agent_id_for_facts, fact,
+                                &channel_for_facts, &chat_id_for_facts,
+                                &session_for_facts,
+                            ));
+                        }
+                    }).await;
+                });
+            }
+        }
+
+        // ── Prediction-driven evolution ──────────────────────────────
+        // (BLOCKER R2-2) When the prediction engine is unconfigured the
+        // spawned trust-feedback path below never runs, so citations
+        // accumulate in the global `CitationTracker` until the 1-hour GC
+        // reaps them — a slow memory leak under sustained traffic. Drain
+        // the bucket synchronously here before deciding whether to proceed.
+        if ctx.prediction_engine.is_none() {
+            let _ = duduclaw_memory::feedback::global_tracker().drain(&turn_id);
+        }
+        if let Some(pe) = ctx.prediction_engine.as_ref() {
+            let pe = pe.clone();
+            let gvu = ctx.gvu_loop.clone();
+            let user_id_for_pred = user_id.to_string();
+            let agent_id_for_pred = agent_id.clone();
+            let session_id_for_pred = session_id.to_string();
+            let turn_id_for_pred = turn_id.clone();
+            let text_clone = text.to_string();
+            let reply_clone_for_pred = reply.clone();
+            let home_for_pred = ctx.home_dir.clone();
+            let agent_dir_for_pred = agent_dir.clone();
+            let sm_for_pred = ctx.session_manager.clone();
+            let skill_cache_for_pred = ctx.skill_cache.clone();
+            let skill_activation_for_pred = ctx.skill_activation.clone();
+            let skill_lift_for_pred = ctx.skill_lift.clone();
+            let gap_acc_for_pred = ctx.gap_accumulator.clone();
+            let sandbox_for_pred = ctx.sandbox_store.clone();
+            let notebook_for_pred = ctx.mistake_notebook.clone();
+            let memory_db_path_for_pred = ctx.memory_db_path.clone();
+            let ext_factors_cfg = external_factors_config.clone();
+            let evolution_emitter_for_pred = ctx.evolution_emitter.clone();
+
+            tokio::spawn(async move {
+                // RAII drain guard — if anything below panics or returns
+                // early, the citation tracker bucket for this turn is still
+                // freed. (review HIGH R3-3.) The bus drains explicitly on
+                // happy path; we disarm before that to avoid double-drain.
+                let mut drain_guard = duduclaw_memory::feedback::DrainOnDrop::new(
+                    turn_id_for_pred.clone(),
+                );
+                // 1. Generate prediction (< 1ms, zero LLM)
+                let prediction = pe.predict(&user_id_for_pred, &agent_id_for_pred, &text_clone).await;
+                debug!(
+                    agent = %agent_id_for_pred,
+                    satisfaction = format!("{:.2}", prediction.expected_satisfaction),
+                    confidence = format!("{:.2}", prediction.confidence),
+                    "Prediction generated"
+                );
+
+                // 2. Extract conversation metrics
+                let messages = sm_for_pred.get_messages(&session_id_for_pred).await.unwrap_or_default();
+                let metrics = crate::prediction::metrics::ConversationMetrics::extract(
+                    &session_id_for_pred,
+                    &agent_id_for_pred,
+                    &user_id_for_pred,
+                    &messages,
+                    0,
+                );
+
+                // 3. Calculate prediction error (embedding ~5ms if available, otherwise < 1ms)
+                let (error, embedding) = pe.calculate_error(&prediction, &metrics).await;
+
+                // 3.5 Log evolution event: PredictionError (Sutskever Day 1)
+                pe.log_evolution_event(
+                    "prediction_error",
+                    &agent_id_for_pred,
+                    Some(error.composite_error),
+                    Some(&format!("{:?}", error.category)),
+                    None, None, None,
+                );
+
+                // 4. Update user model — pass pre-computed embedding to avoid redundant embed()
+                pe.update_model_with_embedding(&metrics, embedding).await;
+
+                // 4.5 Conversation outcome detection + MistakeNotebook (Phase 1 GVU²)
+                // Skip for very short conversations (< 4 messages) to avoid false positives (review #28)
+                let mut error = error;
+                let conv_outcome = if messages.len() >= 4 {
+                    Some(crate::prediction::outcome::ConversationOutcome::extract(
+                        &session_id_for_pred, &agent_id_for_pred, &messages,
+                    ))
+                } else {
+                    None
+                };
+                // Apply task completion signal to prediction error
+                if let Some(ref outcome) = conv_outcome {
+                    let meta = pe.metacognition.lock().await;
+                    error.apply_outcome(outcome, &meta.thresholds);
+                }
+
+                // ── Wiki RL trust feedback (Phase 2) ───────────────────
+                // After the error is fully adjusted, dispatch to the trust
+                // feedback bus so wiki pages cited during this turn get
+                // their trust nudged up/down. Drains the citation tracker
+                // for `turn_id_for_pred` (not session_id) so each turn's
+                // citations are attributed only to its own prediction error.
+                // (review B1)
+                if let Some(bus) = crate::prediction::feedback_bus::TrustFeedbackBus::from_globals() {
+                    let _ = bus.on_prediction_error(
+                        &turn_id_for_pred,
+                        &agent_id_for_pred,
+                        &error,
+                    );
+                } else {
+                    // Trust store not initialised — drain tracker manually
+                    // to keep memory bounded.
+                    let _ = duduclaw_memory::feedback::global_tracker()
+                        .drain(&turn_id_for_pred);
+                }
+                // Bus / fallback path drained the bucket — disarm the RAII
+                // guard so it doesn't double-drain on scope exit.
+                drain_guard.disarm();
+                // Record failure to MistakeNotebook for grounded GVU
+                if let Some(ref outcome) = conv_outcome {
+                    if outcome.is_failure() {
+                        if let Some(ref nb) = notebook_for_pred {
+                            let category = match outcome.task_type {
+                                crate::prediction::outcome::TaskType::Coding => crate::gvu::mistake_notebook::MistakeCategory::Capability,
+                                crate::prediction::outcome::TaskType::QA => crate::gvu::mistake_notebook::MistakeCategory::Factual,
+                                _ => crate::gvu::mistake_notebook::MistakeCategory::Behavioral,
+                            };
+                            let what_wrong = match outcome.satisfaction {
+                                crate::prediction::outcome::SatisfactionSignal::Negative => "User expressed dissatisfaction",
+                                _ => "Task not completed",
+                            };
+                            let entry = crate::gvu::mistake_notebook::build_mistake_entry(
+                                &agent_id_for_pred,
+                                &session_id_for_pred,
+                                category,
+                                &text_clone,
+                                &reply_clone_for_pred,
+                                what_wrong,
+                                None,
+                            );
+                            if let Err(e) = nb.record(&entry) {
+                                warn!(agent = %agent_id_for_pred, "Failed to record mistake: {e}");
+                            } else if let Some(ref dbp) = memory_db_path_for_pred {
+                                // F2b: when this category accumulates ≥3 unresolved
+                                // mistakes, consolidate them into a semantic memory
+                                // rule. Detached so it never delays the reply path.
+                                let nb2 = nb.clone();
+                                let dbp2 = dbp.clone();
+                                let aid2 = agent_id_for_pred.clone();
+                                tokio::spawn(async move {
+                                    match crate::reflexion::maybe_consolidate(
+                                        &nb2, &dbp2, &aid2, category,
+                                        crate::reflexion::DEFAULT_CONSOLIDATE_THRESHOLD,
+                                    )
+                                    .await
+                                    {
+                                        Ok(Some(id)) => info!(
+                                            agent = %aid2, semantic_id = %id,
+                                            "reflexion consolidated mistakes into semantic memory"
+                                        ),
+                                        Ok(None) => {}
+                                        Err(e) => warn!(
+                                            agent = %aid2,
+                                            "reflexion consolidation failed: {e}"
+                                        ),
+                                    }
+                                });
+                            }
+                        }
+                    }
+                }
+
+                // 5. Skill lifecycle: diagnose + activate + track lift
+                {
+                    let compressed: Vec<_> = {
+                        let cache = skill_cache_for_pred.lock().await;
+                        cache.all().into_iter().cloned().collect()
+                    };
+
+                    // Diagnose error and suggest skills
+                    if let Some(diagnosis) = crate::skill_lifecycle::diagnostician::diagnose(&error, &compressed) {
+                        // Activate suggested skills
+                        if !diagnosis.suggested_skills.is_empty() {
+                            let mut ctrl = skill_activation_for_pred.lock().await;
+                            for skill_name in &diagnosis.suggested_skills {
+                                let evicted = ctrl.activate(&agent_id_for_pred, skill_name, error.composite_error);
+                                // Sprint N P0: emit skill_deactivate for capacity eviction (non-blocking)
+                                // activate() returns the evicted skill name when max_active is reached.
+                                if let Some(ref evicted_skill) = evicted {
+                                    evolution_emitter_for_pred.emit_skill_deactivate(
+                                        &agent_id_for_pred,
+                                        evicted_skill,
+                                        "capacity_eviction",
+                                        serde_json::json!({
+                                            "reason": "max_active_capacity_exceeded",
+                                            "new_skill": skill_name,
+                                        }),
+                                    );
+                                }
+                                // Sprint N P0: emit skill_activate audit event (non-blocking)
+                                evolution_emitter_for_pred.emit_skill_activate(
+                                    &agent_id_for_pred,
+                                    skill_name,
+                                    "prediction_error_diagnosis",
+                                );
+                            }
+                        }
+                        // Report skill gap to evolution engine + accumulate for synthesis
+                        if let Some(ref gap) = diagnosis.skill_gap {
+                            crate::skill_lifecycle::gap::inject_skill_gap(gap, &home_for_pred, &agent_id_for_pred);
+
+                            // Accumulate gap for potential auto-synthesis
+                            let trigger = {
+                                let mut acc = gap_acc_for_pred.lock().await;
+                                acc.record_gap(&agent_id_for_pred, gap, error.composite_error)
+                            };
+                            if let Some(trigger) = trigger {
+                                info!(
+                                    agent = %agent_id_for_pred,
+                                    topic = %trigger.topic,
+                                    gap_count = trigger.gap_count,
+                                    "Skill synthesis trigger fired — queuing synthesis"
+                                );
+                                // Log synthesis trigger event to feedback.jsonl
+                                // Use structured fields to prevent second-order injection via topic
+                                let signal = serde_json::json!({
+                                    "signal_type": "synthesis_trigger",
+                                    "agent_id": &agent_id_for_pred,
+                                    "topic": &trigger.topic,
+                                    "gap_count": trigger.gap_count,
+                                    "avg_composite_error": trigger.avg_composite_error,
+                                    "channel": "skill_synthesis",
+                                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                                });
+                                let feedback_path = home_for_pred.join("feedback.jsonl");
+                                let feedback_clone = feedback_path.clone();
+                                let signal_str = signal.to_string();
+                                // Non-blocking write to avoid stalling async runtime
+                                tokio::task::spawn_blocking(move || {
+                                    use std::io::Write;
+                                    if let Err(e) = std::fs::OpenOptions::new()
+                                        .create(true)
+                                        .append(true)
+                                        .open(&feedback_clone)
+                                        .and_then(|mut f| writeln!(f, "{}", signal_str))
+                                    {
+                                        tracing::warn!(
+                                            path = %feedback_clone.display(),
+                                            error = %e,
+                                            "Failed to write synthesis trigger to feedback.jsonl"
+                                        );
+                                    }
+                                });
+
+                                // Mark topic as pending to prevent re-triggering during
+                                // async synthesis. Call confirm_synthesis() on success or
+                                // cancel_pending() on failure to resume gap accumulation.
+                                {
+                                    let mut acc = gap_acc_for_pred.lock().await;
+                                    acc.mark_pending(&agent_id_for_pred, &trigger.topic);
+                                }
+                            }
+                        }
+                    }
+
+                    // Record conversation for activation effectiveness tracking
+                    {
+                        let mut ctrl = skill_activation_for_pred.lock().await;
+                        ctrl.record_conversation(&agent_id_for_pred, error.composite_error);
+                    }
+
+                    // Track lift for each skill (active vs inactive)
+                    {
+                        let active = {
+                            let ctrl = skill_activation_for_pred.lock().await;
+                            ctrl.get_active(&agent_id_for_pred)
+                        };
+                        let mut lift_store = skill_lift_for_pred.lock().await;
+                        for skill in &compressed {
+                            let tracker = lift_store.get_or_create(&agent_id_for_pred, &skill.name);
+                            if active.contains(&skill.name) {
+                                tracker.record_with(error.composite_error);
+                            } else {
+                                tracker.record_without(error.composite_error);
+                            }
+                        }
+                    }
+                }
+
+                // 6. Periodic: evaluate activations + scan distillation (every ~20 conversations)
+                {
+                    // Use prediction count as conversation counter (low overhead)
+                    let should_evaluate = pe.metacognition.lock().await.total_predictions % 20 == 0;
+                    if should_evaluate {
+                        // Evaluate and prune ineffective skills
+                        let deactivated = {
+                            let mut ctrl = skill_activation_for_pred.lock().await;
+                            ctrl.evaluate_all(&agent_id_for_pred)
+                        };
+                        for name in &deactivated {
+                            info!(agent = %agent_id_for_pred, skill = %name, "Skill deactivated by effectiveness evaluation");
+                            // Sprint N P0: emit skill_deactivate audit event (non-blocking)
+                            evolution_emitter_for_pred.emit_skill_deactivate(
+                                &agent_id_for_pred,
+                                name,
+                                "effectiveness_evaluation",
+                                serde_json::json!({"reason": "prediction_error_not_improved"}),
+                            );
+                        }
+
+                        // Scan for distillation candidates
+                        let candidates = {
+                            let lift_store = skill_lift_for_pred.lock().await;
+                            let trackers = lift_store.get_all(&agent_id_for_pred);
+                            crate::skill_lifecycle::distillation::scan_for_distillation(&agent_id_for_pred, &trackers)
+                        };
+                        for candidate in &candidates {
+                            info!(
+                                agent = %agent_id_for_pred,
+                                skill = %candidate.skill_name,
+                                readiness = format!("{:.2}", candidate.readiness),
+                                lift = format!("{:.3}", candidate.lift),
+                                "Skill ready for distillation into SOUL.md"
+                            );
+                            // Distillation via GVU would be triggered here in production
+                            // (requires async GVU call — deferred to dedicated distillation task)
+                        }
+
+                        // Scan for graduation candidates (cross-agent migration)
+                        {
+                            let lift_store = skill_lift_for_pred.lock().await;
+                            let trackers = lift_store.get_all(&agent_id_for_pred);
+                            let criteria = crate::skill_lifecycle::graduation::GraduationCriteria::default();
+                            for tracker in &trackers {
+                                if let Some(candidate) = crate::skill_lifecycle::graduation::check_graduation(tracker, &criteria) {
+                                    info!(
+                                        agent = %agent_id_for_pred,
+                                        skill = %candidate.skill_name,
+                                        lift = format!("{:.3}", candidate.lift),
+                                        "Skill eligible for graduation to global scope"
+                                    );
+                                }
+                            }
+                        }
+
+                        // Evaluate sandbox trials
+                        // Lock ordering: collect data from each lock independently,
+                        // never hold lift_store and sandbox_store simultaneously.
+                        {
+                            let sandbox_names = {
+                                let store = sandbox_for_pred.lock().await;
+                                store.active_names(&agent_id_for_pred)
+                            };
+
+                            // Collect tracker snapshots (lift data) — release lift_store before sandbox
+                            let tracker_snapshots: Vec<_> = {
+                                let lift_store = skill_lift_for_pred.lock().await;
+                                sandbox_names.iter().filter_map(|name| {
+                                    lift_store.get_all(&agent_id_for_pred)
+                                        .into_iter()
+                                        .find(|t| t.skill_name == *name)
+                                        .map(|t| (name.clone(), t.clone()))
+                                }).collect()
+                            }; // lift_store released here
+
+                            for (name, tracker) in &tracker_snapshots {
+                                let sandboxed = {
+                                    let store = sandbox_for_pred.lock().await;
+                                    store.get(&agent_id_for_pred, name).cloned()
+                                };
+                                if let Some(sandboxed) = sandboxed {
+                                    let outcome = crate::skill_lifecycle::sandbox_trial::evaluate_trial(tracker, &sandboxed);
+                                    match outcome.decision {
+                                        crate::skill_lifecycle::sandbox_trial::TrialDecision::Graduate => {
+                                            info!(agent = %agent_id_for_pred, skill = %name, "Sandbox trial → GRADUATE");
+                                            let mut store = sandbox_for_pred.lock().await;
+                                            store.graduate(&agent_id_for_pred, name);
+                                        }
+                                        crate::skill_lifecycle::sandbox_trial::TrialDecision::Discard => {
+                                            info!(agent = %agent_id_for_pred, skill = %name, reason = %outcome.reason, "Sandbox trial → DISCARD");
+                                            let mut store = sandbox_for_pred.lock().await;
+                                            store.discard(&agent_id_for_pred, name);
+                                            let mut ctrl = skill_activation_for_pred.lock().await;
+                                            ctrl.deactivate(&agent_id_for_pred, name);
+                                            // Sprint N P0: emit skill_deactivate audit event (non-blocking)
+                                            evolution_emitter_for_pred.emit_skill_deactivate(
+                                                &agent_id_for_pred,
+                                                name,
+                                                "sandbox_trial_discard",
+                                                serde_json::json!({"reason": outcome.reason}),
+                                            );
+                                        }
+                                        crate::skill_lifecycle::sandbox_trial::TrialDecision::ExtendTrial(extra) => {
+                                            if extra > 0 {
+                                                let mut store = sandbox_for_pred.lock().await;
+                                                store.extend_ttl(&agent_id_for_pred, name, extra);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            // Tick all sandbox TTLs
+                            let mut store = sandbox_for_pred.lock().await;
+                            store.tick_agent(&agent_id_for_pred);
+                        }
+                    }
+                }
+
+                // 7. Route to evolution action (with hardening: ε-floor + anti-sycophancy)
+                // Snapshot consistency first, then lock exploration (audit #1: avoid dual mutex)
+                let consecutive = pe.consecutive_significant_count(&agent_id_for_pred).await;
+                let consistency_snapshot = pe.consistency.lock().await.clone();
+                let action = {
+                    let mut exploration = pe.exploration.lock().await;
+                    crate::prediction::router::route(&error, consecutive, &mut exploration, &consistency_snapshot)
+                };
+
+                match action {
+                    crate::prediction::router::EvolutionAction::None => {}
+                    crate::prediction::router::EvolutionAction::StoreEpisodic { content, importance } => {
+                        let preview: String = content.chars().take(80).collect();
+                        debug!(agent = %agent_id_for_pred, "Storing episodic observation: {preview}");
+
+                        // Persist to per-agent memory.db
+                        let mem_dir = home_for_pred.join("agents").join(&agent_id_for_pred).join("state");
+                        if let Err(e) = std::fs::create_dir_all(&mem_dir) {
+                            warn!(agent = %agent_id_for_pred, "Failed to create memory state dir: {e}");
+                        } else {
+                            let db_path = mem_dir.join("memory.db");
+                            match duduclaw_memory::engine::SqliteMemoryEngine::new(&db_path) {
+                                Ok(engine) => {
+                                    let entry = duduclaw_core::types::MemoryEntry {
+                                        id: uuid::Uuid::new_v4().to_string(),
+                                        agent_id: agent_id_for_pred.clone(),
+                                        content,
+                                        timestamp: chrono::Utc::now(),
+                                        tags: vec![],
+                                        embedding: None,
+                                        layer: duduclaw_core::types::MemoryLayer::Episodic,
+                                        importance,
+                                        access_count: 0,
+                                        last_accessed: None,
+                                        source_event: "prediction_episodic".to_string(),
+                                    };
+                                    if let Err(e) = engine.store(&agent_id_for_pred, entry).await {
+                                        warn!(agent = %agent_id_for_pred, "Failed to store episodic memory: {e}");
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(agent = %agent_id_for_pred, "Failed to open memory db: {e}");
+                                }
+                            }
+                        }
+                    }
+                    crate::prediction::router::EvolutionAction::TriggerReflection { ref context }
+                    | crate::prediction::router::EvolutionAction::TriggerEmergencyEvolution { ref context } => {
+                        let is_emergency = matches!(
+                            action,
+                            crate::prediction::router::EvolutionAction::TriggerEmergencyEvolution { .. }
+                        );
+                        if is_emergency {
+                            warn!(agent = %agent_id_for_pred, error = format!("{:.3}", error.composite_error), "Critical prediction error → emergency evolution");
+                        } else {
+                            info!(agent = %agent_id_for_pred, error = format!("{:.3}", error.composite_error), "Prediction error → triggering reflection");
+                        }
+
+                        // Log evolution event: GVU trigger (Sutskever Day 1)
+                        let etype = if context.contains("Epistemic Foraging") {
+                            "epistemic_foraging"
+                        } else if context.contains("Anti-Sycophancy") {
+                            "sycophancy_alert"
+                        } else {
+                            "gvu_trigger"
+                        };
+                        pe.log_evolution_event(
+                            etype,
+                            &agent_id_for_pred,
+                            Some(error.composite_error),
+                            Some(&format!("{:?}", error.category)),
+                            Some(&context.chars().take(500).collect::<String>()),
+                            None, None,
+                        );
+
+                        // Enrich trigger context with external factors for Significant/Critical errors
+                        let enriched_context = {
+                            let ext = crate::external_factors::collect_external_factors(
+                                &home_for_pred, &agent_id_for_pred, &ext_factors_cfg,
+                            ).await;
+                            let ext_prompt = ext.to_prompt();
+                            if ext_prompt.is_empty() {
+                                context.clone()
+                            } else {
+                                format!("{context}\n\n{ext_prompt}")
+                            }
+                        };
+
+                        // Sprint N P0 stub — signal suppression point for stagnation detection.
+                        // TODO P1: replace `false` with real stagnation_detection threshold check.
+                        //   P0 canonical stub metadata (Spec §1.1 — Option C, null placeholders):
+                        //     { "suppressed_signal": null, "trigger_count": null, "window_seconds": null }
+                        //   P1 example with real data (fill in actual values from stagnation config):
+                        //   e.g.: if consecutive >= stagnation_cfg.trigger_threshold {
+                        //       evolution_emitter_for_pred.emit_signal_suppressed_stub(
+                        //           &agent_id_for_pred,
+                        //           serde_json::json!({
+                        //               "suppressed_signal": "prediction_error_diagnosis",
+                        //               "trigger_count": consecutive,
+                        //               "window_seconds": stagnation_cfg.window_seconds,
+                        //           }),
+                        //       );
+                        //       // skip GVU trigger
+                        //   }
+                        let _signal_should_suppress = false; // always false in P0
+
+                        // Run GVU loop if available
+                        if let (Some(gvu), Some(dir)) = (&gvu, &agent_dir_for_pred) {
+                            let contract = duduclaw_agent::contract::load_contract(dir);
+                            let pre_metrics = crate::gvu::version_store::VersionMetrics::default();
+                            let home = home_for_pred.clone();
+
+                            // LLM caller: RFC-25 Phase 2 — route GVU evolution through
+                            // the provider-agnostic choke-point so it honours the agent's
+                            // [runtime] provider and [model] utility instead of forcing Claude.
+                            let utility_model = crate::runtime_config::agent_utility_model(dir);
+                            let call_llm = |prompt: String| {
+                                let h = home.clone();
+                                let d = dir.clone();
+                                let aid = agent_id_for_pred.clone();
+                                let model = utility_model.clone();
+                                async move {
+                                    crate::runtime_dispatch::run_agent_prompt_text(
+                                        crate::runtime_dispatch::AgentPrompt {
+                                            agent_dir: Some(&d),
+                                            home_dir: &h,
+                                            agent_id: &aid,
+                                            prompt: &prompt,
+                                            system_prompt: "",
+                                            model: &model,
+                                            max_tokens: 4096,
+                                        },
+                                    )
+                                    .await
+                                }
+                            };
+
+                            // Query MistakeNotebook for grounded generation context
+                            let relevant_mistakes = notebook_for_pred
+                                .as_ref()
+                                .map(|nb| nb.query_by_agent(&agent_id_for_pred, 5))
+                                .unwrap_or_default();
+
+                            // Get MetaCognition snapshot for adaptive depth
+                            let meta_snapshot = pe.metacognition.lock().await.clone();
+
+                            let outcome = gvu.run_with_context(
+                                &agent_id_for_pred,
+                                dir,
+                                &enriched_context,
+                                pre_metrics,
+                                &contract.boundaries.must_not,
+                                &contract.boundaries.must_always,
+                                call_llm,
+                                Some(&meta_snapshot),
+                                relevant_mistakes,
+                            ).await;
+
+                            // Log outcome and feed back to metacognition
+                            match outcome {
+                                crate::gvu::loop_::GvuOutcome::Applied(ref version) => {
+                                    info!(
+                                        agent = %agent_id_for_pred,
+                                        version = %version.version_id,
+                                        "GVU applied SOUL.md change"
+                                    );
+                                    // Sprint N P0: emit gvu_generation audit event (non-blocking)
+                                    evolution_emitter_for_pred.emit_gvu_generation(
+                                        &agent_id_for_pred,
+                                        crate::evolution_events::schema::Outcome::Success,
+                                        &etype,
+                                        serde_json::json!({"gvu_outcome": "applied", "version_id": version.version_id}),
+                                    );
+                                    let mut meta = pe.metacognition.lock().await;
+                                    meta.record_outcome(error.category, true);
+                                }
+                                crate::gvu::loop_::GvuOutcome::Abandoned { ref last_gradient } => {
+                                    warn!(
+                                        agent = %agent_id_for_pred,
+                                        critique = %last_gradient.critique,
+                                        "GVU abandoned all attempts"
+                                    );
+                                    // Sprint N P0: emit gvu_generation audit event (non-blocking)
+                                    evolution_emitter_for_pred.emit_gvu_generation(
+                                        &agent_id_for_pred,
+                                        crate::evolution_events::schema::Outcome::Failure,
+                                        &etype,
+                                        serde_json::json!({"gvu_outcome": "abandoned", "critique": last_gradient.critique}),
+                                    );
+                                    let mut meta = pe.metacognition.lock().await;
+                                    meta.record_outcome(error.category, false);
+                                }
+                                crate::gvu::loop_::GvuOutcome::Skipped { ref reason } => {
+                                    debug!(agent = %agent_id_for_pred, reason, "GVU skipped");
+                                    // Sprint N P0: emit gvu_generation audit event (non-blocking)
+                                    evolution_emitter_for_pred.emit_gvu_generation(
+                                        &agent_id_for_pred,
+                                        crate::evolution_events::schema::Outcome::Failure,
+                                        &etype,
+                                        serde_json::json!({"gvu_outcome": "skipped", "reason": reason}),
+                                    );
+                                    if !reason.contains("observation") {
+                                        let mut meta = pe.metacognition.lock().await;
+                                        meta.record_outcome(error.category, false);
+                                    }
+                                }
+                                crate::gvu::loop_::GvuOutcome::Deferred { retry_count, retry_after_hours, .. } => {
+                                    info!(
+                                        agent = %agent_id_for_pred,
+                                        retry_count,
+                                        retry_after_hours,
+                                        "GVU deferred — will retry with accumulated gradients"
+                                    );
+                                    // Sprint N P0: emit gvu_generation audit event (non-blocking)
+                                    evolution_emitter_for_pred.emit_gvu_generation(
+                                        &agent_id_for_pred,
+                                        crate::evolution_events::schema::Outcome::Failure,
+                                        &etype,
+                                        serde_json::json!({"gvu_outcome": "deferred", "retry_count": retry_count, "retry_after_hours": retry_after_hours}),
+                                    );
+                                    // Don't record as outcome yet — will be evaluated on retry
+                                }
+                                crate::gvu::loop_::GvuOutcome::TimedOut { elapsed, generations_completed, .. } => {
+                                    warn!(
+                                        agent = %agent_id_for_pred,
+                                        elapsed_secs = elapsed.as_secs(),
+                                        generations_completed,
+                                        "GVU timed out — wall-clock budget exceeded"
+                                    );
+                                    // Sprint N P0: emit gvu_generation audit event (non-blocking)
+                                    evolution_emitter_for_pred.emit_gvu_generation(
+                                        &agent_id_for_pred,
+                                        crate::evolution_events::schema::Outcome::Failure,
+                                        &etype,
+                                        serde_json::json!({"gvu_outcome": "timed_out", "elapsed_secs": elapsed.as_secs(), "generations_completed": generations_completed}),
+                                    );
+                                    // Treat as inconclusive — don't record outcome
+                                }
+                            }
+
+                            // ── Proactive rule evaluation (post-GVU) ─────────
+                            {
+                                use duduclaw_agent::proactive::{
+                                    extract_proactive_rules, RuleContext, RuleEvaluator,
+                                };
+
+                                let proactive_rules =
+                                    extract_proactive_rules(&contract.boundaries.must_always);
+
+                                if !proactive_rules.is_empty() {
+                                    // Build context from available data.
+                                    // hours_since_last_interaction: approximate from
+                                    // conversation messages (last turn timestamp).
+                                    let hours_since = {
+                                        let msgs = sm_for_pred
+                                            .get_messages(&session_id_for_pred)
+                                            .await
+                                            .unwrap_or_default();
+                                        msgs.last()
+                                            .and_then(|m| {
+                                                chrono::DateTime::parse_from_rfc3339(&m.timestamp)
+                                                    .ok()
+                                                    .map(|ts| {
+                                                        let elapsed = chrono::Utc::now()
+                                                            - ts.with_timezone(&chrono::Utc);
+                                                        (elapsed.num_seconds().max(0) as f32)
+                                                            / 3600.0
+                                                    })
+                                            })
+                                            .unwrap_or(0.0)
+                                    };
+
+                                    let recent_events: Vec<String> = Vec::new();
+                                    let active_patterns: Vec<String> = Vec::new();
+
+                                    let rule_ctx = RuleContext {
+                                        hours_since_last_interaction: hours_since,
+                                        recent_events,
+                                        active_patterns,
+                                    };
+
+                                    let mut evaluator = RuleEvaluator::new();
+                                    let triggered =
+                                        evaluator.evaluate(&proactive_rules, &rule_ctx);
+
+                                    for (rule, message) in &triggered {
+                                        info!(
+                                            agent = %agent_id_for_pred,
+                                            rule = %rule.source_contract,
+                                            "Proactive rule fired: {message}"
+                                        );
+                                    }
+
+                                    if !triggered.is_empty() {
+                                        debug!(
+                                            agent = %agent_id_for_pred,
+                                            count = triggered.len(),
+                                            "Proactive rules evaluated post-GVU"
+                                        );
+                                    }
+                                }
+                            }
+                        } else {
+                            warn!(
+                                agent = %agent_id_for_pred,
+                                "Evolution triggered but GVU loop not available — skipping"
+                            );
+                        }
+                    }
+                }
+            });
+        }
+
+        // ── Wiki ingest (async, non-blocking) ────────────────────
+        {
+            let user_text_for_wiki = sanitized_text.clone();
+            let reply_for_wiki = reply.clone();
+            let agent_id_for_wiki = agent_id.clone();
+            let session_for_wiki = session_id.to_string();
+            let home_for_wiki = ctx.home_dir.clone();
+            tokio::spawn(async move {
+                crate::wiki_ingest::run_ingest(
+                    &user_text_for_wiki,
+                    &reply_for_wiki,
+                    &agent_id_for_wiki,
+                    &session_for_wiki,
+                    &home_for_wiki,
+                ).await;
+            });
+        }
+
+        // ── Phase 3: Record trajectory for skill extraction ──────
+        // Start or continue recording the conversation trajectory.
+        // Recording is finalized when the next user message contains
+        // positive/negative feedback (see "within 2 turns" check above).
+        {
+            let session_key = format!("{session_id}:{agent_id}");
+            let mut recorder = ctx.skill_recorder.lock().await;
+            if !recorder.is_recording(&session_key) {
+                recorder.start(&session_key, &agent_id);
+                recorder.record_turn(&session_key, "user", text, vec![]);
+            }
+            // Record the assistant reply turn
+            // Tool names are not available here (streamed via CLI), so empty for now.
+            // Future: parse tool_use events from streaming and pass them through.
+            recorder.record_turn(&session_key, "assistant", &reply, vec![]);
+        }
+
+        // Check if compression needed; generate Claude summary then compress in background
+        let sm = ctx.session_manager.clone();
+        let sid = session_id.to_string();
+        let home_for_compress = ctx.home_dir.clone();
+        tokio::spawn(async move {
+            if sm.should_compress(&sid).await {
+                // Gather last messages to summarise
+                let msgs = sm.get_messages(&sid).await.unwrap_or_default();
+                let transcript = {
+                    let mut buf = String::with_capacity(msgs.len() * 350);
+                    for m in &msgs {
+                        if !buf.is_empty() { buf.push('\n'); }
+                        use std::fmt::Write;
+                        let _ = write!(buf, "[{}] {}", m.role, &m.content[..m.content.len().min(300)]);
+                    }
+                    buf
+                };
+                let prompt = format!(
+                    "Summarize the following conversation history concisely for use as context \
+                     in future turns. Include key facts, decisions, and outcomes. Max 400 words.\n\n{transcript}"
+                );
+                let summary = match call_claude_cli_lightweight(&prompt, crate::runtime_config::DEFAULT_UTILITY_MODEL, &home_for_compress).await {
+                    Ok(s) => s,
+                    Err(_) => "[Session compressed — previous conversation summary omitted for brevity]".to_string(),
+                };
+                if let Err(e) = sm.compress(&sid, &summary).await {
+                    warn!("Session compression failed: {e}");
+                }
+            }
+        });
+
+        return reply;
+    }
+
+    // 3. Fallback: classified error message
+    let reg = ctx.registry.read().await;
+    let name = reg
+        .main_agent()
+        .map(|a| a.config.agent.display_name.clone())
+        .unwrap_or_else(|| "DuDuClaw".to_string());
+    drop(reg);
+
+    let err_str = last_cli_error.clone().unwrap_or_else(|| "No error info".to_string());
+    let reason = classify_cli_failure(&err_str);
+    warn!(
+        agent = %name,
+        reason = ?reason,
+        last_error = %err_str.chars().take(200).collect::<String>(),
+        "Channel reply fallback — all providers failed"
+    );
+
+    // Append a structured audit line so the dashboard can surface failure trends.
+    let audit = serde_json::json!({
+        "event": "channel_reply_fallback",
+        "agent": name,
+        "session_id": session_id,
+        "reason": format!("{reason:?}"),
+        "error": err_str.chars().take(300).collect::<String>(),
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    });
+    if let Ok(line) = serde_json::to_string(&audit) {
+        let path = ctx.home_dir.join("channel_failures.jsonl");
+        if let Ok(mut f) = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .await
+        {
+            use tokio::io::AsyncWriteExt;
+            let _ = f.write_all(format!("{line}\n").as_bytes()).await;
+        }
+    }
+
+    format_fallback_message(&name, reason)
+}
+
+/// Classified failure category for `claude` CLI / Python SDK calls.
+///
+/// Drives the user-facing fallback message so we tell the user *why*
+/// it actually failed (rate limit, timeout, etc.) rather than always
+/// suggesting they re-run `claude auth status`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FailureReason {
+    /// `claude` binary was not found on the filesystem.
+    BinaryMissing,
+    /// All rotator accounts exhausted due to rate-limit / usage-limit / 429.
+    RateLimited,
+    /// Billing / credit exhausted (402, insufficient_quota).
+    Billing,
+    /// Claude CLI reported "Not logged in" / authentication failure.
+    /// Distinct from BinaryMissing (binary exists, just not authenticated).
+    AuthFailed,
+    /// 30-minute hard timeout tripped.
+    Timeout,
+    /// Subprocess failed to spawn or exited non-zero without recognizable cause.
+    SpawnError,
+    /// CLI returned empty output after trimming.
+    EmptyResponse,
+    /// No rotator accounts configured.
+    NoAccounts,
+    /// CLI failed but local model replied successfully.
+    /// Contains the original CLI error for user transparency.
+    LocalModelFallback(String),
+    /// Fallback — unrecognized error string.
+    Unknown,
+}
+
+/// Classify an error string produced by `call_claude_cli_rotated` or `call_python_sdk_v2`.
+pub(crate) fn classify_cli_failure(err: &str) -> FailureReason {
+    let lower = err.to_lowercase();
+
+    if lower.contains("claude cli not found") {
+        return FailureReason::BinaryMissing;
+    }
+    // Auth failures come through the stream-json `is_error` branch as
+    // "claude CLI stream error: Not logged in · Please run /login" or
+    // "claude CLI assistant error: authentication_failed".
+    if lower.contains("not logged in")
+        || lower.contains("authentication_failed")
+        || lower.contains("please run /login")
+    {
+        return FailureReason::AuthFailed;
+    }
+    if lower.contains("hard timeout") {
+        return FailureReason::Timeout;
+    }
+    if lower.contains("empty response") {
+        return FailureReason::EmptyResponse;
+    }
+    if lower.contains("no accounts") || lower.contains("no account configured") {
+        return FailureReason::NoAccounts;
+    }
+    // Reuse the shared billing/rate classifiers so we stay in sync with claude_runner.
+    if crate::claude_runner::is_billing_error(err) {
+        return FailureReason::Billing;
+    }
+    if crate::claude_runner::is_rate_limit_error(err) {
+        return FailureReason::RateLimited;
+    }
+    if lower.contains("spawn error")
+        || lower.contains("no such file")
+        || lower.contains("exit ")
+        || lower.contains("read error")
+    {
+        return FailureReason::SpawnError;
+    }
+    FailureReason::Unknown
+}
+
+/// Build a zh-TW user-facing message for a classified failure.
+///
+/// Messages directly tell the user *why* CLI failed (rate limit, billing, etc.)
+/// and whether a local model fallback was used.
+pub(crate) fn format_fallback_message(agent_name: &str, reason: FailureReason) -> String {
+    match reason {
+        FailureReason::BinaryMissing => format!(
+            "{agent_name} 暫時無法回應：系統找不到 Claude Code CLI。\n\
+             請確認已安裝，並執行：\n\
+             $ claude auth status"
+        ),
+        FailureReason::AuthFailed => format!(
+            "{agent_name} 無法回應：Claude Code 未登入或認證失效。\n\
+             請在終端執行：\n\
+             $ claude /login\n\
+             登入完成後，可繼續對我說話。"
+        ),
+        FailureReason::RateLimited => format!(
+            "{agent_name} 暫時忙線中（API 使用量已達上限），請稍後再試。\n\
+             系統會在背景自動偵測恢復，屆時將自動切回 Claude。\n\
+             若持續發生，可在儀表板加入備用 OAuth 帳號以啟用自動輪替。"
+        ),
+        FailureReason::Billing => format!(
+            "{agent_name} 無法回應：目前帳號額度已用完。\n\
+             請於 Anthropic Console 儲值，或在儀表板切換到其他有效帳號。"
+        ),
+        FailureReason::Timeout => format!(
+            "{agent_name} 這次處理超時（已達 30 分鐘安全上限）。\n\
+             請重新送出訊息，或將任務拆成較小的步驟。"
+        ),
+        FailureReason::SpawnError => format!(
+            "{agent_name} 啟動 Claude Code 子程序失敗。\n\
+             請查看 ~/.duduclaw/debug.log 取得詳細錯誤。"
+        ),
+        FailureReason::EmptyResponse => format!(
+            "{agent_name} 這次沒有回覆內容（空回應）。\n\
+             請重送訊息；若持續發生請回報。"
+        ),
+        FailureReason::NoAccounts => format!(
+            "{agent_name} 目前沒有可用的 Claude 帳號。\n\
+             請先到儀表板設定 OAuth 或 API Key。"
+        ),
+        FailureReason::LocalModelFallback(ref cli_err) => {
+            let reason_hint = classify_cli_error_hint(cli_err);
+            format!(
+                "⚠️ Claude CLI 暫時不可用（{reason_hint}），本次由本地模型代為回應。\n\
+                 系統會在背景自動偵測 CLI 恢復，屆時將自動切回 Claude。"
+            )
+        }
+        FailureReason::Unknown => format!(
+            "{agent_name} 暫時無法回應。\n\
+             請稍後再試，或查看 ~/.duduclaw/debug.log 取得詳細原因。"
+        ),
+    }
+}
+
+/// Translate a raw CLI error into a short zh-TW hint for the user.
+fn classify_cli_error_hint(err: &str) -> &'static str {
+    let reason = classify_cli_failure(err);
+    match reason {
+        FailureReason::RateLimited => "使用量已達上限",
+        FailureReason::Billing => "帳號額度用完",
+        FailureReason::AuthFailed => "認證失效",
+        FailureReason::Timeout => "處理超時",
+        FailureReason::EmptyResponse => "空回應",
+        FailureReason::BinaryMissing => "CLI 未安裝",
+        FailureReason::NoAccounts => "無可用帳號",
+        FailureReason::SpawnError => "程序啟動失敗",
+        _ => "連線異常",
+    }
+}
+
+#[cfg(test)]
+mod multi_turn_tests {
+    use super::*;
+
+    #[test]
+    fn trim_turn_content_short_passthrough() {
+        let short = "Hello world";
+        assert_eq!(trim_turn_content(short), short);
+    }
+
+    #[test]
+    fn trim_turn_content_at_threshold() {
+        let exactly = "a".repeat(TURN_TRIM_THRESHOLD);
+        assert_eq!(trim_turn_content(&exactly), exactly);
+    }
+
+    #[test]
+    fn trim_turn_content_over_threshold() {
+        let long = "x".repeat(TURN_TRIM_THRESHOLD + 100);
+        let result = trim_turn_content(&long);
+        assert!(result.contains("[trimmed"));
+        assert!(result.len() < long.len());
+    }
+
+    #[test]
+    fn trim_turn_content_cjk_safe() {
+        // 900 CJK chars — each is 3 bytes in UTF-8.
+        // This would panic with byte-level slicing.
+        let cjk = "你好世界".repeat(225); // 4 chars × 225 = 900 chars
+        assert_eq!(cjk.chars().count(), 900);
+        let result = trim_turn_content(&cjk);
+        assert!(result.contains("[trimmed"));
+        // Verify result is valid UTF-8 (would panic if not)
+        let _ = result.as_bytes();
+    }
+
+    #[test]
+    fn format_history_empty() {
+        assert_eq!(
+            format_history_as_prompt(&[], "hello"),
+            "hello"
+        );
+    }
+
+    #[test]
+    fn format_history_single_turn() {
+        let history = vec![ConversationTurn {
+            role: "user".to_string(),
+            content: "hi".to_string(),
+        }];
+        let result = format_history_as_prompt(&history, "world");
+        assert!(result.contains("<conversation_history>"));
+        assert!(result.contains("<user>hi</user>"));
+        assert!(result.ends_with("world"));
+    }
+
+    #[test]
+    fn format_history_xml_escaping() {
+        let history = vec![ConversationTurn {
+            role: "assistant".to_string(),
+            content: "Use </assistant> tag carefully".to_string(),
+        }];
+        let result = format_history_as_prompt(&history, "ok");
+        // The closing tag in content should be escaped
+        assert!(!result.contains("Use </assistant> tag"));
+        assert!(result.contains("&lt;/assistant&gt;"));
+    }
+
+    #[test]
+    fn recap_prefix_with_pinned() {
+        let pinned = "- Goal: build two teams\n- PM: daily 8:00 report";
+        let msg = "開始建立團隊";
+        let result = format!("<task_recap>\n{pinned}\n</task_recap>\n\n{msg}");
+        assert!(result.contains("<task_recap>"));
+        assert!(result.contains("build two teams"));
+        assert!(result.ends_with("開始建立團隊"));
+    }
+
+    #[test]
+    fn recap_skipped_when_no_pinned() {
+        let pinned = "";
+        let msg = "hello";
+        // When pinned is empty, effective_message = sanitized_text (no recap)
+        let effective = if pinned.is_empty() { msg.to_string() } else {
+            format!("<task_recap>\n{pinned}\n</task_recap>\n\n{msg}")
+        };
+        assert_eq!(effective, "hello");
+    }
+}
+
+#[cfg(test)]
+mod fallback_tests {
+    use super::*;
+
+    #[test]
+    fn classify_rate_limit_variants() {
+        assert_eq!(classify_cli_failure("Error 429 rate limit reached"), FailureReason::RateLimited);
+        assert_eq!(classify_cli_failure("usage limit exceeded"), FailureReason::RateLimited);
+        assert_eq!(classify_cli_failure("All accounts exhausted. Last error: overloaded"), FailureReason::RateLimited);
+    }
+
+    #[test]
+    fn classify_billing_variants() {
+        assert_eq!(classify_cli_failure("insufficient_quota credit balance"), FailureReason::Billing);
+        assert_eq!(classify_cli_failure("HTTP 402 payment required"), FailureReason::Billing);
+    }
+
+    #[test]
+    fn classify_timeout() {
+        assert_eq!(
+            classify_cli_failure("claude CLI hard timeout (1800s, no output)"),
+            FailureReason::Timeout
+        );
+    }
+
+    #[test]
+    fn classify_binary_missing() {
+        assert_eq!(classify_cli_failure("claude CLI not found in PATH"), FailureReason::BinaryMissing);
+    }
+
+    #[test]
+    fn classify_empty_response() {
+        assert_eq!(classify_cli_failure("Empty response from claude CLI"), FailureReason::EmptyResponse);
+    }
+
+    /// Regression lock: v1.3.13 added diagnostic suffixes to Empty / exit
+    /// errors. The classifier's substring match must still identify the
+    /// reason so user-facing messages stay specific.
+    #[test]
+    fn classify_empty_response_with_diagnostic_suffix() {
+        let err = "Empty response from claude CLI (exit=0 lines=42 events=30 \
+                   assistant=2 text_blocks=0 thinking=1 tool_use=0 result_events=1 \
+                   result_subtype=Some(\"success\") stop_reason=Some(\"tool_use\") \
+                   last_line=\"{\\\"type\\\":\\\"result\\\"...}\" stderr_tail=\"\")";
+        assert_eq!(classify_cli_failure(err), FailureReason::EmptyResponse);
+    }
+
+    #[test]
+    fn classify_exit_code_with_diagnostic_suffix() {
+        let err = "claude CLI exit 1 (exit=1 lines=3 events=2 \
+                   assistant=0 text_blocks=0 thinking=0 tool_use=0 result_events=0 \
+                   result_subtype=None stop_reason=None last_line=\"\" stderr_tail=\"\")";
+        assert_eq!(classify_cli_failure(err), FailureReason::SpawnError);
+    }
+
+    #[test]
+    fn classify_spawn_error() {
+        assert_eq!(classify_cli_failure("claude CLI spawn error: No such file"), FailureReason::SpawnError);
+        assert_eq!(classify_cli_failure("claude CLI exit 127"), FailureReason::SpawnError);
+    }
+
+    #[test]
+    fn classify_unknown_fallthrough() {
+        assert_eq!(classify_cli_failure("some weird unrelated thing"), FailureReason::Unknown);
+    }
+
+    #[test]
+    fn classify_auth_failed_variants() {
+        // Stream-json error path — what channel_reply surfaces after the fix.
+        assert_eq!(
+            classify_cli_failure("claude CLI stream error: Not logged in · Please run /login"),
+            FailureReason::AuthFailed
+        );
+        // Assistant event error field path.
+        assert_eq!(
+            classify_cli_failure("claude CLI assistant error: authentication_failed"),
+            FailureReason::AuthFailed
+        );
+        // Raw "please run /login" text without the prefix.
+        assert_eq!(
+            classify_cli_failure("Please run /login to authenticate"),
+            FailureReason::AuthFailed
+        );
+    }
+
+    #[test]
+    fn message_auth_failed_tells_user_to_login() {
+        let msg = format_fallback_message("Agnes", FailureReason::AuthFailed);
+        assert!(msg.contains("Agnes"));
+        assert!(msg.contains("未登入") || msg.contains("認證失效"));
+        assert!(msg.contains("/login"));
+        // Must NOT say "claude auth status" (that's the BinaryMissing hint
+        // and doesn't fix an auth problem on its own).
+        assert!(!msg.contains("auth status"));
+    }
+
+    #[test]
+    fn message_rate_limited_contains_busy_string_not_auth_status() {
+        let msg = format_fallback_message("Agnes", FailureReason::RateLimited);
+        assert!(msg.contains("Agnes"));
+        assert!(msg.contains("忙線中"));
+        assert!(!msg.contains("auth status"));
+    }
+
+    #[test]
+    fn message_binary_missing_keeps_auth_status_hint() {
+        let msg = format_fallback_message("Agnes", FailureReason::BinaryMissing);
+        assert!(msg.contains("找不到 Claude Code"));
+        assert!(msg.contains("auth status"));
+    }
+
+    #[test]
+    fn message_timeout_mentions_30_min() {
+        let msg = format_fallback_message("Agnes", FailureReason::Timeout);
+        assert!(msg.contains("30 分鐘"));
+    }
+}
+
+#[cfg(test)]
+mod rotation_tests {
+    use super::*;
+    use duduclaw_agent::account_rotator::{
+        Account, AccountRotator, AuthMethod, RotationStrategy,
+    };
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// Build a synthetic OAuth account for testing.
+    ///
+    /// Sets `credentials_dir` to a fake path so `is_available()` returns true
+    /// without needing real keychain state.
+    fn fake_oauth_account(id: &str, priority: u32) -> Account {
+        Account {
+            id: id.to_string(),
+            auth_method: AuthMethod::OAuth,
+            priority,
+            monthly_budget_cents: 0,
+            tags: vec![],
+            profile: "test".to_string(),
+            email: format!("{id}@example.com"),
+            subscription: "pro".to_string(),
+            label: id.to_string(),
+            expires_at: None,
+            api_key: String::new(),
+            oauth_token: Some(format!("tok_{id}")),
+            credentials_dir: Some(PathBuf::from(format!("/tmp/fake/{id}"))),
+            is_healthy: true,
+            consecutive_errors: 0,
+            spent_this_month: 0,
+            cooldown_until: None,
+            last_used: None,
+            total_requests: 0,
+        }
+    }
+
+    /// Scenario: first account rate-limited, second succeeds.
+    ///
+    /// Verifies:
+    /// 1. rotate_cli_spawn advances to the second account after a rate-limit error
+    /// 2. first account is placed in cooldown via on_rate_limited
+    /// 3. successful result is returned from the second account
+    #[tokio::test]
+    async fn rotation_advances_past_rate_limited_account() {
+        let rotator = AccountRotator::new(RotationStrategy::Priority, 120);
+        // Lower priority number = selected first under Priority strategy.
+        rotator.push_account_for_test(fake_oauth_account("first", 1)).await;
+        rotator.push_account_for_test(fake_oauth_account("second", 2)).await;
+        assert_eq!(rotator.count().await, 2);
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_cloned = call_count.clone();
+
+        let result = rotate_cli_spawn(
+            &rotator,
+            move |env_vars| {
+                let n = call_count_cloned.fetch_add(1, Ordering::SeqCst);
+                // First attempt: simulate rate limit.
+                // Second attempt: return success with a distinctive body.
+                async move {
+                    // Sanity: env_vars should contain OAuth token for the selected account.
+                    assert!(env_vars.contains_key("CLAUDE_CODE_OAUTH_TOKEN"));
+                    if n == 0 {
+                        Err("Error 429 rate limit reached".to_string())
+                    } else {
+                        Ok("hello from second".to_string())
+                    }
+                }
+            },
+            100,
+        )
+        .await;
+
+        assert_eq!(result.as_deref(), Ok("hello from second"));
+        assert_eq!(call_count.load(Ordering::SeqCst), 2, "both accounts should be tried");
+
+        // First account should now be unavailable (cooldown), second still healthy.
+        let statuses = rotator.status().await;
+        let first = statuses.iter().find(|s| s.id == "first").unwrap();
+        let second = statuses.iter().find(|s| s.id == "second").unwrap();
+        assert!(!first.is_available, "first account should be in cooldown after rate-limit");
+        assert!(second.is_available, "second account should remain available");
+        assert_eq!(second.total_requests, 1, "second account should have one success recorded");
+    }
+
+    /// Scenario: both accounts fail with the same error.
+    ///
+    /// Verifies:
+    /// 1. Both accounts are exercised
+    /// 2. Final Err carries the last underlying error string (not a generic message)
+    /// 3. The error is classifiable (so the fallback message will be specific)
+    #[tokio::test]
+    async fn rotation_all_fail_propagates_last_error() {
+        let rotator = AccountRotator::new(RotationStrategy::Priority, 120);
+        rotator.push_account_for_test(fake_oauth_account("a", 1)).await;
+        rotator.push_account_for_test(fake_oauth_account("b", 2)).await;
+
+        let result = rotate_cli_spawn(
+            &rotator,
+            |_env_vars| async move {
+                Err::<String, _>("claude CLI hard timeout (1800s, no output)".to_string())
+            },
+            100,
+        )
+        .await;
+
+        let err = result.expect_err("should fail when all accounts fail");
+        assert!(err.contains("All accounts exhausted"), "expected aggregator prefix, got: {err}");
+        assert!(
+            err.contains("hard timeout"),
+            "expected last error to be propagated, got: {err}"
+        );
+
+        // Extracted error must still be classifiable as Timeout (not Unknown).
+        assert_eq!(classify_cli_failure(&err), FailureReason::Timeout);
+    }
+
+    /// Scenario: billing-exhausted error places the account on a 24h cooldown.
+    #[tokio::test]
+    async fn rotation_billing_error_triggers_long_cooldown() {
+        let rotator = AccountRotator::new(RotationStrategy::Priority, 120);
+        rotator.push_account_for_test(fake_oauth_account("broke", 1)).await;
+
+        let result = rotate_cli_spawn(
+            &rotator,
+            |_env_vars| async move {
+                Err::<String, _>("HTTP 402 insufficient_quota credit balance".to_string())
+            },
+            100,
+        )
+        .await;
+
+        assert!(result.is_err());
+        let statuses = rotator.status().await;
+        let broke = &statuses[0];
+        assert!(!broke.is_healthy, "billing-exhausted account should be marked unhealthy");
+        assert!(!broke.is_available, "should be unavailable during 24h cooldown");
+    }
+
+    /// T4.7 smoke replacement: single good OAuth account — no regression.
+    ///
+    /// When exactly one healthy account exists and the spawn closure succeeds
+    /// immediately, we should return that response on the first attempt and
+    /// record success.
+    #[tokio::test]
+    async fn single_account_success_is_first_try() {
+        let rotator = AccountRotator::new(RotationStrategy::Priority, 120);
+        rotator.push_account_for_test(fake_oauth_account("only", 1)).await;
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_cloned = attempts.clone();
+
+        let result = rotate_cli_spawn(
+            &rotator,
+            move |_env_vars| {
+                attempts_cloned.fetch_add(1, Ordering::SeqCst);
+                async move { Ok::<String, String>("OK".to_string()) }
+            },
+            50,
+        )
+        .await;
+
+        assert_eq!(result.as_deref(), Ok("OK"));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        let status = &rotator.status().await[0];
+        assert_eq!(status.total_requests, 1);
+        assert!(status.is_available);
+    }
+
+    /// T4.9 smoke replacement: forced rate-limit → user sees 忙線中 message.
+    ///
+    /// End-to-end path from spawn failure → rotator exhaustion → error
+    /// propagation → `classify_cli_failure` → `format_fallback_message`.
+    /// Asserts the user-facing text is the RateLimited variant, not
+    /// the misleading BinaryMissing "please install and auth" hint.
+    #[tokio::test]
+    async fn end_to_end_rate_limit_yields_busy_message() {
+        let rotator = AccountRotator::new(RotationStrategy::Priority, 120);
+        rotator.push_account_for_test(fake_oauth_account("one", 1)).await;
+        rotator.push_account_for_test(fake_oauth_account("two", 2)).await;
+
+        let result = rotate_cli_spawn(
+            &rotator,
+            |_env_vars| async move {
+                Err::<String, _>("Error 429 rate limit: usage limit exceeded".to_string())
+            },
+            50,
+        )
+        .await;
+
+        let err = result.expect_err("should fail");
+        let reason = classify_cli_failure(&err);
+        assert_eq!(reason, FailureReason::RateLimited);
+
+        let user_msg = format_fallback_message("Agnes", reason);
+        assert!(user_msg.contains("Agnes"));
+        assert!(user_msg.contains("忙線中"), "must say busy: {user_msg}");
+        assert!(
+            !user_msg.contains("auth status"),
+            "must NOT suggest re-running auth status on rate limit: {user_msg}"
+        );
+        assert!(
+            !user_msg.contains("找不到"),
+            "must NOT say 'binary not found' on rate limit: {user_msg}"
+        );
+    }
+
+    /// Regression test for the v1.3.12 bug: stream parser used to
+    /// swallow `is_error: true` result events as valid text, which led
+    /// to "Not logged in · Please run /login" being delivered to users
+    /// as Agnes's reply. After the fix, `spawn_claude_cli_with_env`
+    /// returns `Err("claude CLI stream error: Not logged in ...")` and
+    /// the classifier + message builder surface the AuthFailed reason.
+    ///
+    /// We exercise the rotator→classifier→message pipeline by having the
+    /// spawn closure return exactly the error shape the new stream parser
+    /// now produces.
+    #[tokio::test]
+    async fn end_to_end_not_logged_in_yields_auth_failed_message() {
+        let rotator = AccountRotator::new(RotationStrategy::Priority, 120);
+        rotator.push_account_for_test(fake_oauth_account("broken", 1)).await;
+
+        let result = rotate_cli_spawn(
+            &rotator,
+            |_env_vars| async move {
+                Err::<String, _>(
+                    "claude CLI stream error: Not logged in · Please run /login".to_string(),
+                )
+            },
+            50,
+        )
+        .await;
+
+        let err = result.expect_err("auth failure must surface as Err");
+        let reason = classify_cli_failure(&err);
+        assert_eq!(reason, FailureReason::AuthFailed);
+
+        let msg = format_fallback_message("Agnes", reason);
+        assert!(msg.contains("Agnes"));
+        assert!(msg.contains("/login"));
+        assert!(
+            !msg.contains("Not logged in · Please run /login"),
+            "user-facing message must be our zh-TW explanation, not raw CLI text"
+        );
+    }
+
+    /// T4.8 smoke replacement: empty-rotator → `call_claude_cli_rotated`
+    /// fresh-install passthrough. We can't actually spawn `claude`, but the
+    /// primitive behaviour of "empty rotator returns exhausted-Err" is
+    /// verified below; the outer function's fall-through to
+    /// `call_claude_cli` is a one-liner trivially correct by inspection.
+    #[tokio::test]
+    async fn rotation_empty_rotator_returns_empty_exhausted() {
+        let rotator = AccountRotator::new(RotationStrategy::Priority, 120);
+        assert_eq!(rotator.count().await, 0);
+
+        let result = rotate_cli_spawn(
+            &rotator,
+            |_env_vars| async move { Ok::<String, String>("never called".to_string()) },
+            100,
+        )
+        .await;
+
+        let err = result.expect_err("empty rotator should return err from primitive");
+        assert!(err.contains("All accounts exhausted"));
+        // Last error is empty because no attempt was made
+        assert!(err.ends_with("Last error: "));
+    }
+}
+
+// ── Python SDK subprocess ───────────────────────────────────
+
+// ── Claude Code SDK (claude CLI) ────────────────────────────
+
+// ── Streaming progress types ───────────────────────────────
+
+/// Progress events emitted during Claude CLI streaming.
+///
+/// Sent to the channel via callback so users see real-time progress
+/// instead of silence during long-running agentic tasks.
+#[derive(Debug, Clone)]
+pub enum ProgressEvent {
+    /// Periodic keepalive — no new stream-json events for `keepalive_interval`.
+    Keepalive,
+    /// Claude is using a tool (parsed from stream-json `tool_use` content block).
+    ToolUse {
+        tool: String,
+        /// Optional file path or search pattern extracted from tool input.
+        detail: Option<String>,
+    },
+}
+
+impl ProgressEvent {
+    /// Format as a user-facing progress message.
+    pub fn to_display(&self) -> String {
+        match self {
+            Self::Keepalive => "⏳ 仍在處理中…".to_string(),
+            Self::ToolUse { tool, detail } => {
+                let action = match tool.as_str() {
+                    "Read" | "read" => "正在讀取",
+                    "Write" | "write" => "正在撰寫",
+                    "Edit" | "edit" => "正在編輯",
+                    "Grep" | "grep" | "search" => "正在搜尋",
+                    "Glob" | "glob" => "正在搜尋檔案",
+                    "Bash" | "bash" => "正在執行指令",
+                    _ => "正在使用工具",
+                };
+                match detail {
+                    Some(d) => format!("⏳ {action} {d}…"),
+                    None => format!("⏳ {action}…"),
+                }
+            }
+        }
+    }
+}
+
+/// Callback type for sending progress events to the channel.
+///
+/// The callback is `Send + Sync` so it can be invoked from the streaming loop.
+/// Implementations should be lightweight (just enqueue a message send).
+pub type ProgressCallback = Box<dyn Fn(ProgressEvent) + Send + Sync>;
+
+/// Keepalive interval — send progress if no stream-json events for this long.
+pub(crate) const KEEPALIVE_INTERVAL_SECS: u64 = 90;
+
+/// Hard max timeout — absolute safety net to kill truly hung processes.
+const HARD_MAX_TIMEOUT_SECS: u64 = 30 * 60; // 30 minutes
+
+/// Internal wrapper for GVU loop / internal-utility LLM calls.
+///
+/// RFC-25 Phase 0: the previous hard allowlist *rejected* any model that wasn't
+/// `claude-haiku-4-5`, which made evolution/internal tasks impossible to run on
+/// a different (even Claude-family) model and blocked the multi-runtime goal.
+/// We now warn on unrecognised evolution models instead of failing — the agent's
+/// configured `[model] utility` is honoured. Provider-level routing (Codex/Gemini)
+/// arrives via the choke-point in Phase 1-2.
+const KNOWN_EVOLUTION_MODELS: &[&str] = &["claude-haiku-4-5", "claude-haiku-4-5-20250307"];
+
+pub(crate) async fn call_claude_cli_public(
+    user_message: &str,
+    model: &str,
+    system_prompt: &str,
+    home_dir: &Path,
+) -> Result<String, String> {
+    if !KNOWN_EVOLUTION_MODELS.contains(&model) {
+        warn!(model, "call_claude_cli_public: non-default evolution/utility model — proceeding (RFC-25 Phase 0)");
+    }
+    // Use account-rotated path so GVU benefits from multi-account failover
+    // instead of failing silently when the ambient account is rate-limited.
+    call_claude_cli_rotated(user_message, model, system_prompt, home_dir, None, None, None, None, &[]).await
+}
+
+/// Call the `claude` CLI (Claude Code SDK) with streaming output.
+///
+/// Uses `--output-format stream-json --verbose` to read incremental events.
+/// Instead of killing on idle, sends keepalive progress to the channel via
+/// `on_progress` callback. A hard max timeout (30 min) acts as safety net.
+///
+/// Thin wrapper around [`spawn_claude_cli_with_env`] that uses the ambient
+/// environment (and any configured `ANTHROPIC_API_KEY` as fallback). This is
+/// the no-rotation path — used by compression and GVU reflection helpers.
+/// The main channel-reply path goes through [`call_claude_cli_rotated`].
+async fn call_claude_cli(
+    user_message: &str,
+    model: &str,
+    system_prompt: &str,
+    home_dir: &Path,
+    work_dir: Option<&Path>,
+    on_progress: Option<&ProgressCallback>,
+    capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
+) -> Result<String, String> {
+    let empty: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    spawn_claude_cli_with_env(
+        user_message, model, system_prompt, home_dir, work_dir,
+        on_progress, capabilities, &empty, None,
+    ).await
+}
+
+/// Lightweight Claude CLI call for single-turn metadata tasks.
+///
+/// Optimized for: session compression, instruction extraction, key-fact extraction,
+/// GVU evolution, wiki ingest. Uses `--bare --effort medium --max-turns 1
+/// --no-session-persistence --tools ""` for minimal overhead and cost.
+///
+/// Estimated 25-40% cost reduction vs the full channel reply path.
+async fn call_claude_cli_lightweight(
+    prompt: &str,
+    model: &str,
+    home_dir: &Path,
+) -> Result<String, String> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let claude_path = duduclaw_core::which_claude()
+        .ok_or_else(|| "claude CLI not found in PATH".to_string())?;
+
+    let api_key = get_api_key(home_dir).await;
+
+    let mut cmd = duduclaw_core::platform::async_command_for(&claude_path);
+    cmd.args([
+        // NOTE: `--bare` removed — Claude CLI 2.1.110 regresses OAuth auth when
+        // the flag is active (kills keychain lookup alongside the hook/LSP skips).
+        // Lightweight path still relies on --max-turns 1 + --no-session-persistence
+        // + --tools "" to keep the call cheap.
+        "--effort", "medium",        // Balanced: no full thinking but adequate extraction quality
+        "--max-turns", "1",          // Single-turn only (no tool use)
+        "--no-session-persistence",  // Throwaway call, don't save session
+        "--tools", "",               // Disable all built-in tools (pure text response)
+        "-p", prompt,
+        "--model", model,
+        "--output-format", "stream-json",
+        "--verbose",
+        "--dangerously-skip-permissions",
+    ]);
+
+    if let Some(ref key) = api_key {
+        cmd.env("ANTHROPIC_API_KEY", key);
+    }
+    cmd.env_remove("CLAUDECODE");
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    cmd.kill_on_drop(true);
+
+    let mut child = cmd.spawn().map_err(|e| format!("claude CLI spawn error: {e}"))?;
+    let stdout = child.stdout.take().ok_or("failed to capture stdout")?;
+    let mut reader = BufReader::new(stdout).lines();
+
+    let mut result_text = String::new();
+    while let Ok(Some(line)) = reader.next_line().await {
+        if let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) {
+            if let Some(text) = event.get("result").and_then(|r| r.as_str()) {
+                if !text.is_empty() {
+                    result_text = text.to_string();
+                }
+            }
+            if event.get("type").and_then(|t| t.as_str()) == Some("assistant") {
+                if let Some(content) = event.get("message")
+                    .and_then(|m| m.get("content"))
+                    .and_then(|c| c.as_array())
+                {
+                    for block in content {
+                        if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                            if let Some(t) = block.get("text").and_then(|t| t.as_str()) {
+                                if !t.is_empty() {
+                                    result_text = t.to_string();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let status = child.wait().await.map_err(|e| format!("wait error: {e}"))?;
+    if !status.success() && result_text.is_empty() {
+        return Err(format!("claude CLI exited with {status}"));
+    }
+
+    if result_text.is_empty() {
+        Err("Empty response from lightweight CLI call".to_string())
+    } else {
+        Ok(result_text)
+    }
+}
+
+/// Try the `claude` CLI with rotation across configured `AccountRotator` accounts.
+///
+/// On each attempt the rotator selects an account and yields its env vars
+/// (`CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CONFIG_DIR`, or `ANTHROPIC_API_KEY`).
+/// Classifies failures and feeds them back to the rotator so unhealthy
+/// accounts cool down correctly. Falls through to the non-rotated path
+/// when no accounts are configured (fresh-install passthrough).
+pub(crate) async fn call_claude_cli_rotated(
+    user_message: &str,
+    model: &str,
+    system_prompt: &str,
+    home_dir: &Path,
+    work_dir: Option<&Path>,
+    on_progress: Option<&ProgressCallback>,
+    capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
+    // `_session_id` retained in the signature for call-site compatibility;
+    // the Claude CLI `--resume` path was removed (see module note above
+    // `rotate_cli_spawn` invocation). History is folded into the prompt
+    // instead.
+    _session_id: Option<&str>,
+    conversation_history: &[ConversationTurn],
+) -> Result<String, String> {
+    let rotator = match crate::claude_runner::get_rotator_cached(home_dir).await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(error = %e, "Rotator unavailable — falling back to non-rotated CLI path");
+            // Fallback: prepend history to prompt for non-rotated path
+            let effective_msg = if conversation_history.is_empty() {
+                user_message.to_string()
+            } else {
+                format_history_as_prompt(conversation_history, user_message)
+            };
+            return call_claude_cli(
+                &effective_msg, model, system_prompt, home_dir, work_dir,
+                on_progress, capabilities,
+            ).await;
+        }
+    };
+
+    let account_count = rotator.count().await;
+    if account_count == 0 {
+        // Fresh install — no accounts configured. Use ambient env.
+        let effective_msg = if conversation_history.is_empty() {
+            user_message.to_string()
+        } else {
+            format_history_as_prompt(conversation_history, user_message)
+        };
+        return call_claude_cli(
+            &effective_msg, model, system_prompt, home_dir, work_dir,
+            on_progress, capabilities,
+        ).await;
+    }
+
+    // Delegate to the testable primitive with a closure that actually spawns the CLI.
+    //
+    // Claude CLI `-p --resume <id>` only accepts either a canonical UUID (that
+    // already exists in its session store) or an exact session title match, so
+    // DuDuClaw's deterministic `dd-<hash>` IDs were rejected 100% of the time
+    // and every multi-turn wasted one CLI spawn before falling back to
+    // history-in-prompt. We skip `--resume` entirely and always fold the
+    // conversation history into the prompt when there is any — one spawn per
+    // turn, no log noise, no cost duplication.
+    let input_len = user_message.len();
+    let history_clone = conversation_history.to_vec();
+    rotate_cli_spawn(&rotator, move |env_vars| {
+        let model = model.to_string();
+        let system_prompt = system_prompt.to_string();
+        let home_dir = home_dir.to_path_buf();
+        let work_dir = work_dir.map(|p| p.to_path_buf());
+        let on_progress = on_progress;
+        let capabilities = capabilities.cloned();
+        let history = history_clone.clone();
+        let user_message_owned = user_message.to_string();
+        async move {
+            let effective_prompt = if history.is_empty() {
+                user_message_owned
+            } else {
+                format_history_as_prompt(&history, &user_message_owned)
+            };
+            spawn_claude_cli_with_env(
+                &effective_prompt, &model, &system_prompt, &home_dir,
+                work_dir.as_deref(), on_progress, capabilities.as_ref(),
+                &env_vars, None,
+            ).await
+        }
+    }, input_len).await
+}
+
+/// Rotation-loop primitive, decoupled from the actual subprocess spawn.
+///
+/// Iterates `rotator.select()` up to `rotator.count()` times. For each
+/// selected account, calls the provided `spawn` closure with the env-var
+/// map. On success, records cost telemetry and returns. On failure,
+/// classifies the error and feeds it back to the rotator (`on_billing_exhausted`,
+/// `on_rate_limited`, or `on_error`). Returns the last error when all
+/// accounts are exhausted.
+///
+/// `input_size_hint` is used for rough API-key cost accounting when the
+/// spawn closure doesn't extract token usage from the CLI stream.
+pub(crate) async fn rotate_cli_spawn<F, Fut>(
+    rotator: &duduclaw_agent::account_rotator::AccountRotator,
+    spawn: F,
+    input_size_hint: usize,
+) -> Result<String, String>
+where
+    F: Fn(std::collections::HashMap<String, String>) -> Fut,
+    Fut: std::future::Future<Output = Result<String, String>>,
+{
+    let account_count = rotator.count().await;
+    let max_attempts = account_count.max(1);
+    let mut last_error = String::new();
+
+    for attempt in 0..max_attempts {
+        let Some(selected) = rotator.select().await else {
+            break;
+        };
+        info!(account = %selected.id, attempt, "Channel CLI attempt");
+
+        match spawn(selected.env_vars.clone()).await {
+            Ok(text) => {
+                // Channel calls don't extract token usage from streams, so cost
+                // is 0 (OAuth subscription) or a rough estimate (API key).
+                let cost = if selected.auth_method == duduclaw_agent::account_rotator::AuthMethod::OAuth {
+                    0
+                } else {
+                    ((input_size_hint + text.len()) / 1000).max(1) as u64
+                };
+                rotator.on_success(&selected.id, cost).await;
+                return Ok(text);
+            }
+            Err(e) => {
+                last_error = e.clone();
+                if crate::claude_runner::is_billing_error(&e) {
+                    warn!(account = %selected.id, error = %e, "Account billing exhausted — 24h cooldown");
+                    rotator.on_billing_exhausted(&selected.id).await;
+                } else if crate::claude_runner::is_rate_limit_error(&e) {
+                    warn!(account = %selected.id, error = %e, "Account rate-limited — cooldown");
+                    rotator.on_rate_limited(&selected.id).await;
+                } else {
+                    warn!(account = %selected.id, error = %e, "Account CLI attempt failed");
+                    rotator.on_error(&selected.id).await;
+                }
+            }
+        }
+    }
+
+    Err(format!("All accounts exhausted. Last error: {last_error}"))
+}
+
+/// Core primitive: spawn the `claude` CLI subprocess with a streaming JSON reader.
+///
+/// `env_vars` allows the caller to inject per-account credentials
+/// (e.g. `CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CONFIG_DIR`, `ANTHROPIC_API_KEY`).
+/// When `env_vars` is empty, falls back to the ambient env plus any
+/// `ANTHROPIC_API_KEY` discovered via [`get_api_key`].
+///
+/// An empty-string value in `env_vars` is treated as a `remove` directive —
+/// this matches `AccountRotator::select()` semantics (it emits an empty
+/// `ANTHROPIC_API_KEY` to force OAuth paths not to leak an API key).
+#[allow(clippy::too_many_arguments)] // pure extraction of existing call_claude_cli body
+async fn spawn_claude_cli_with_env(
+    user_message: &str,
+    model: &str,
+    system_prompt: &str,
+    home_dir: &Path,
+    work_dir: Option<&Path>,
+    on_progress: Option<&ProgressCallback>,
+    capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
+    env_vars: &std::collections::HashMap<String, String>,
+    claude_session_id: Option<&str>,
+) -> Result<String, String> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    // Find claude binary
+    let claude_path = duduclaw_core::which_claude().ok_or_else(|| "claude CLI not found in PATH".to_string())?;
+
+    // API key is optional — OAuth users authenticate via OS keychain.
+    // Only set ANTHROPIC_API_KEY env var if we have one (as backup/override).
+    // Skipped when the caller provides explicit env_vars (rotator path).
+    let api_key = if env_vars.is_empty() {
+        get_api_key(home_dir).await
+    } else {
+        None
+    };
+
+    let mut cmd = duduclaw_core::platform::async_command_for(&claude_path);
+
+    // Resume an existing Claude CLI session for multi-turn continuity.
+    // Placed before `-p` so the CLI establishes session context first.
+    // Session ID is deterministic: SHA-256(duduclaw_session_id + account_id).
+    if let Some(sid) = claude_session_id {
+        cmd.args(["--resume", sid]);
+    }
+
+    cmd.args([
+        // NOTE: `--bare` was previously used here to skip hooks/LSP/plugin-sync
+        // for ~15-25% latency reduction. Removed because Claude CLI 2.1.110
+        // regresses OAuth authentication when `--bare` is active — the flag
+        // cuts the OS-keychain credential lookup alongside the optimizations,
+        // causing every subprocess call to fail with "Not logged in".
+        // We still rely on --system-prompt-file + --exclude-dynamic-system-prompt-sections
+        // to keep the system prompt stable, which preserves most of the cache
+        // benefit that --bare was chasing.
+        // Move per-machine sections (cwd, env, git status) from system prompt to
+        // first user message. Keeps system prompt stable across turns → better
+        // prompt cache hit rate (~10-15% token reduction on turn 2+).
+        "--exclude-dynamic-system-prompt-sections",
+        "-p", user_message,
+        "--model", model,
+        "--output-format", "stream-json",
+        "--verbose",
+        // Channel subprocess has no TTY — bypass all permission prompts.
+        "--dangerously-skip-permissions",
+        // Allow enough agentic turns for complex tasks.
+        "--max-turns", "50",
+    ]);
+
+    // Apply tool restrictions based on agent capabilities (deny-by-default)
+    {
+        let caps = capabilities.cloned().unwrap_or_default();
+        let denied = caps.disallowed_tools();
+        if !denied.is_empty() {
+            let denied_csv = denied.join(",");
+            cmd.args(["--disallowedTools", &denied_csv]);
+        }
+        // Signal bash-gate.sh to allow browser automation commands
+        if caps.browser_via_bash {
+            cmd.env("DUDUCLAW_BROWSER_VIA_BASH", "1");
+        }
+    }
+    // Set working directory to agent dir so Claude can access agent config
+    // (.claude/, CLAUDE.md, .mcp.json) and project files (docs/, etc.)
+    if let Some(dir) = work_dir {
+        // Install the agent-file-guard PreToolUse hook into
+        // <agent_dir>/.claude/settings.json before spawning. This blocks
+        // the sub-agent from using raw Write/Edit to create agent-structure
+        // files (agent.toml/SOUL.md/…) outside <home>/agents/<name>/.
+        // Best-effort — logs warning on failure but does not abort spawn.
+        let bin = crate::agent_hook_installer::resolve_duduclaw_bin();
+        if let Err(e) = crate::agent_hook_installer::ensure_agent_hook_settings(dir, &bin).await {
+            warn!(
+                agent_dir = %dir.display(),
+                error = %e,
+                "Failed to install agent-file-guard hook — spawn continuing without enforcement"
+            );
+        }
+        cmd.current_dir(dir);
+
+        // --bare disables .mcp.json auto-discovery, so explicitly specify it.
+        // --strict-mcp-config ensures no ambient global MCP leaks into agent context.
+        let mcp_json = dir.join(".mcp.json");
+        if mcp_json.exists() {
+            cmd.args(["--mcp-config", &mcp_json.to_string_lossy()]);
+            cmd.arg("--strict-mcp-config");
+        }
+    }
+    if let Some(ref key) = api_key {
+        cmd.env("ANTHROPIC_API_KEY", key);
+    }
+
+    // Apply rotator-provided env vars (overrides any ambient/api_key values).
+    // Empty-string values mean "remove this env var" — used by AccountRotator
+    // to force OAuth paths to not leak a stale ANTHROPIC_API_KEY.
+    for (key, value) in env_vars {
+        if value.is_empty() {
+            cmd.env_remove(key);
+        } else {
+            cmd.env(key, value);
+        }
+    }
+
+    // Pass system prompt via temp file to avoid exposure in /proc/PID/cmdline (BE-C1)
+    let _prompt_guard: Option<tempfile::TempPath> = if !system_prompt.is_empty() {
+        match tempfile::NamedTempFile::new() {
+            Ok(mut f) => {
+                use std::io::Write;
+                let _ = f.write_all(system_prompt.as_bytes());
+                let path = f.into_temp_path();
+                cmd.args(["--system-prompt-file", &path.to_string_lossy()]);
+                Some(path)
+            }
+            Err(_) => {
+                cmd.args(["--system-prompt", system_prompt]);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Inject channel reply context for delegation callback forwarding.
+    // The MCP `send_to_agent` tool reads this env var to register a callback
+    // so sub-agent responses are forwarded back to the originating channel.
+    if let Ok(channel) = crate::claude_runner::REPLY_CHANNEL.try_with(|ch| ch.clone()) {
+        cmd.env(duduclaw_core::ENV_REPLY_CHANNEL, &channel);
+    }
+
+    // v1.10: Inject wiki RL trust feedback context so the MCP server can
+    // forward turn_id / session_id into BusMessage when enqueueing
+    // sub-agent dispatch. Without this, sub-agent RAG citations are not
+    // attributed back to the originating turn's prediction error.
+    if let Ok(Some(turn_id)) =
+        duduclaw_memory::feedback::CURRENT_TURN_ID.try_with(|t| t.clone())
+    {
+        cmd.env(duduclaw_core::ENV_TRUST_TURN_ID, &turn_id);
+    }
+    if let Ok(Some(session_id)) =
+        duduclaw_memory::feedback::CURRENT_SESSION_ID.try_with(|s| s.clone())
+    {
+        cmd.env(duduclaw_core::ENV_TRUST_SESSION_ID, &session_id);
+    }
+
+    // Prevent "nested session" error when gateway was launched from a Claude Code session
+    cmd.env_remove("CLAUDECODE");
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    cmd.kill_on_drop(true);
+
+    let mut child = cmd.spawn().map_err(|e| format!("claude CLI spawn error: {e}"))?;
+    let stdout = child.stdout.take().ok_or("failed to capture stdout")?;
+    let mut reader = BufReader::new(stdout).lines();
+
+    // Drain stderr concurrently and keep the last ~2 KiB for error diagnostics.
+    // Without draining, claude CLI may block if stderr pipe fills up (>64 KiB).
+    let stderr_pipe = child.stderr.take();
+    let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    if let Some(pipe) = stderr_pipe {
+        let buf = stderr_buf.clone();
+        tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut reader = tokio::io::BufReader::new(pipe);
+            let mut chunk = [0u8; 4096];
+            while let Ok(n) = reader.read(&mut chunk).await {
+                if n == 0 {
+                    break;
+                }
+                if let Ok(mut guard) = buf.lock() {
+                    guard.push_str(&String::from_utf8_lossy(&chunk[..n]));
+                    // Keep only the last 2 KiB — we only need tail for diagnostics.
+                    if guard.len() > 2048 {
+                        let cut = guard.len() - 2048;
+                        *guard = guard[cut..].to_string();
+                    }
+                }
+            }
+        });
+    }
+
+    // Optional raw-stream logging for deep debugging. Enable with
+    // `DUDUCLAW_STREAM_DEBUG=1` in the gateway process environment — every
+    // line from `claude`'s stdout is appended to `<home>/claude_stream.log`.
+    // Intentionally off by default (can be large and contains prompts).
+    let stream_debug = std::env::var("DUDUCLAW_STREAM_DEBUG")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let stream_debug_path = if stream_debug {
+        Some(home_dir.join("claude_stream.log"))
+    } else {
+        None
+    };
+
+    let mut result_text = String::new();
+    // RFC-22 P1-7: capture token usage from `result` event so cost_telemetry
+    // can be recorded for channel-path replies (previously: 0 entries for
+    // agnes despite 23-min runs because rotate_cli_spawn discarded usage).
+    let mut token_usage: Option<crate::cost_telemetry::TokenUsage> = None;
+    // Track last tool type to suppress duplicate progress messages
+    let mut last_tool_reported: Option<String> = None;
+
+    // Diagnostic counters — included in the "Empty response" error message
+    // so the next occurrence is immediately actionable (no more needing to
+    // reproduce manually in a shell).
+    let mut lines_seen: u32 = 0;
+    let mut events_parsed: u32 = 0;
+    let mut assistant_events: u32 = 0;
+    let mut text_blocks: u32 = 0;
+    let mut thinking_blocks: u32 = 0;
+    let mut tool_use_blocks: u32 = 0;
+    let mut result_events: u32 = 0;
+    let mut last_raw_line: String = String::new();
+    let mut last_result_subtype: Option<String> = None;
+    let mut last_stop_reason: Option<String> = None;
+
+    // Keepalive timer — fires periodically when no stream events arrive
+    let mut keepalive = tokio::time::interval(
+        std::time::Duration::from_secs(KEEPALIVE_INTERVAL_SECS),
+    );
+    keepalive.reset(); // don't fire immediately
+
+    // Hard max timeout — absolute safety net
+    let hard_deadline = tokio::time::sleep(
+        std::time::Duration::from_secs(HARD_MAX_TIMEOUT_SECS),
+    );
+    tokio::pin!(hard_deadline);
+
+    loop {
+        tokio::select! {
+            // Priority 1: read stream-json events from CLI stdout
+            line_result = reader.next_line() => {
+                match line_result {
+                    // Stream ended normally
+                    Ok(None) => break,
+                    // Read error
+                    Err(e) => {
+                        let _ = child.kill().await;
+                        return Err(format!("claude CLI read error: {e}"));
+                    }
+                    // Got a line — parse stream-json event
+                    Ok(Some(line)) => {
+                        // Reset keepalive timer on every received line
+                        keepalive.reset();
+
+                        if line.trim().is_empty() {
+                            continue;
+                        }
+
+                        lines_seen += 1;
+                        // Keep only a truncated tail for diagnostics (full line
+                        // can contain the user's prompt — we don't want it on disk).
+                        last_raw_line = line.chars().take(400).collect();
+
+                        // Optional raw-stream debug log.
+                        if let Some(ref p) = stream_debug_path {
+                            if let Ok(mut f) = std::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(p)
+                            {
+                                use std::io::Write;
+                                let _ = writeln!(f, "{line}");
+                            }
+                        }
+
+                        if let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) {
+                            events_parsed += 1;
+                            match event.get("type").and_then(|t| t.as_str()) {
+                                // Final result event — contains the complete response.
+                                //
+                                // CRITICAL: the stream-json schema signals terminal
+                                // errors via `is_error: true` on the `result` event
+                                // (e.g. "Not logged in · Please run /login", auth
+                                // failures, rate limits surfaced as synthetic replies).
+                                // Without this check we would swallow the error text
+                                // into `result_text` and return Ok to the caller.
+                                Some("result") => {
+                                    result_events += 1;
+                                    last_result_subtype = event
+                                        .get("subtype")
+                                        .and_then(|s| s.as_str())
+                                        .map(String::from);
+                                    let is_error = event
+                                        .get("is_error")
+                                        .and_then(|v| v.as_bool())
+                                        .unwrap_or(false);
+                                    if is_error {
+                                        let err_text = event
+                                            .get("result")
+                                            .and_then(|r| r.as_str())
+                                            .unwrap_or("Unknown stream-json error");
+                                        let _ = child.kill().await;
+                                        // Include captured stderr tail in the error so we can
+                                        // diagnose cases where Claude CLI sets is_error=true
+                                        // without a meaningful `result` text (e.g. --resume
+                                        // failures, internal CLI errors). Without this the
+                                        // error just says "Unknown stream-json error".
+                                        let stderr_tail = stderr_buf
+                                            .lock()
+                                            .ok()
+                                            .map(|g| g.trim().to_string())
+                                            .filter(|s| !s.is_empty())
+                                            .map(|s| {
+                                                let snippet = duduclaw_core::truncate_bytes(&s, 500);
+                                                format!(" | stderr: {snippet}")
+                                            })
+                                            .unwrap_or_default();
+                                        return Err(format!(
+                                            "claude CLI stream error: {err_text}{stderr_tail}"
+                                        ));
+                                    }
+                                    if let Some(text) = event.get("result").and_then(|r| r.as_str()) {
+                                        // Only overwrite with the result event's text if it's
+                                        // non-empty. When Claude uses tools, the final `result`
+                                        // event often has `result: ""` because the real answer
+                                        // was emitted in intermediate assistant text blocks.
+                                        // Overwriting with "" would discard those responses and
+                                        // trigger a false "Empty response" error.
+                                        if !text.is_empty() {
+                                            result_text = text.to_string();
+                                        }
+                                    }
+                                    // RFC-22 P1-7: extract token usage from the result
+                                    // event. Mirrors claude_runner.rs:1006 (dispatch path)
+                                    // so channel and dispatch paths use identical
+                                    // accounting. result event is the canonical source
+                                    // — fall back to /message/usage on assistant events
+                                    // is left for future work if needed.
+                                    if let Some(usage_val) = event.get("usage") {
+                                        token_usage =
+                                            crate::cost_telemetry::TokenUsage::from_json(usage_val);
+                                    }
+                                }
+                                // Assistant message with content blocks
+                                Some("assistant") => {
+                                    assistant_events += 1;
+                                    // Also check the envelope-level `error` field that
+                                    // newer claude-code versions emit alongside the
+                                    // synthetic assistant message on auth failure.
+                                    if let Some(err) = event.get("error").and_then(|e| e.as_str()) {
+                                        let _ = child.kill().await;
+                                        return Err(format!(
+                                            "claude CLI assistant error: {err}"
+                                        ));
+                                    }
+                                    // Capture stop_reason for diagnostics (max_tokens,
+                                    // tool_use, end_turn, stop_sequence, ...).
+                                    if let Some(sr) = event
+                                        .pointer("/message/stop_reason")
+                                        .and_then(|v| v.as_str())
+                                    {
+                                        last_stop_reason = Some(sr.to_string());
+                                    }
+                                    if let Some(content) = event
+                                        .pointer("/message/content")
+                                        .and_then(|c| c.as_array())
+                                    {
+                                        for block in content {
+                                            let block_type = block.get("type").and_then(|t| t.as_str());
+                                            match block_type {
+                                                Some("text") => {
+                                                    text_blocks += 1;
+                                                    if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                                                        result_text = text.to_string();
+                                                    }
+                                                }
+                                                Some("thinking") => {
+                                                    thinking_blocks += 1;
+                                                }
+                                                Some("tool_use") => {
+                                                    tool_use_blocks += 1;
+                                                    // Extract tool name and detail for progress
+                                                    if let Some(cb) = on_progress {
+                                                        let tool = block.get("name")
+                                                            .and_then(|n| n.as_str())
+                                                            .unwrap_or("unknown")
+                                                            .to_string();
+                                                        let detail = extract_tool_detail(block);
+
+                                                        // Suppress duplicate: same tool consecutively
+                                                        let dominated = last_tool_reported
+                                                            .as_ref()
+                                                            .is_some_and(|prev| *prev == tool && detail.is_none());
+                                                        if !dominated {
+                                                            cb(ProgressEvent::ToolUse {
+                                                                tool: tool.clone(),
+                                                                detail,
+                                                            });
+                                                            last_tool_reported = Some(tool);
+                                                        }
+                                                    }
+                                                }
+                                                _ => {} // tool_result, etc.
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {} // system, rate_limit_event, etc.
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Priority 2: keepalive timer — send progress if silent too long
+            _ = keepalive.tick() => {
+                if let Some(cb) = on_progress {
+                    cb(ProgressEvent::Keepalive);
+                }
+            }
+
+            // Priority 3: hard max timeout — kill truly hung processes
+            _ = &mut hard_deadline => {
+                warn!(
+                    "claude CLI hard timeout ({HARD_MAX_TIMEOUT_SECS}s) — killing process"
+                );
+                let _ = child.kill().await;
+                if result_text.is_empty() {
+                    return Err(format!(
+                        "claude CLI hard timeout ({HARD_MAX_TIMEOUT_SECS}s, no output)"
+                    ));
+                }
+                warn!(
+                    "claude CLI hard timeout — returning partial result ({} chars)",
+                    result_text.len()
+                );
+                break;
+            }
+        }
+    }
+
+    // Wait for process to exit
+    let status = child.wait().await.map_err(|e| format!("wait error: {e}"))?;
+
+    // Snapshot stderr tail for error diagnostics.
+    let stderr_tail: String = stderr_buf
+        .lock()
+        .ok()
+        .map(|g| g.chars().take(400).collect::<String>())
+        .unwrap_or_default();
+
+    // Compose the diagnostic summary that all error sites below embed.
+    // With this in the error string, `channel_failures.jsonl` becomes
+    // self-describing: we can tell whether the CLI produced any output
+    // at all, whether it only produced thinking, whether stop_reason
+    // was "max_tokens" / "tool_use", etc.
+    let diag = format!(
+        "exit={} lines={lines_seen} events={events_parsed} \
+         assistant={assistant_events} text_blocks={text_blocks} \
+         thinking={thinking_blocks} tool_use={tool_use_blocks} \
+         result_events={result_events} \
+         result_subtype={:?} stop_reason={:?} \
+         last_line={:?} stderr_tail={:?}",
+        status.code().unwrap_or(-1),
+        last_result_subtype,
+        last_stop_reason,
+        last_raw_line,
+        stderr_tail,
+    );
+
+    // Any non-zero exit is now a hard failure. Previously we only errored
+    // when `result_text.is_empty()`, which hid synthetic error messages
+    // (e.g. "Not logged in · Please run /login") that Claude CLI emits as
+    // a real result event with `is_error: true` and exit code 1. The
+    // stream-json error check above should have caught those before we
+    // reach here, but the exit-code gate is a defensive backstop.
+    if !status.success() {
+        return Err(format!(
+            "claude CLI exit {} ({diag})",
+            status.code().unwrap_or(-1)
+        ));
+    }
+
+    let result_text = result_text.trim().to_string();
+    if result_text.is_empty() {
+        return Err(format!("Empty response from claude CLI ({diag})"));
+    }
+
+    // RFC-22 P1-7: record cost_telemetry for the channel reply. Skipped when
+    // the task_local agent_id is unset (e.g. invoked outside channel_reply,
+    // such as the dispatch path which already records via claude_runner).
+    if let (Some(usage), Ok(agent_id)) = (
+        token_usage.as_ref(),
+        crate::claude_runner::CHANNEL_REPLY_AGENT_ID.try_with(|id| id.clone()),
+    ) {
+        if !agent_id.is_empty()
+            && let Some(telemetry) = crate::cost_telemetry::get_telemetry()
+        {
+            telemetry
+                .record(
+                    &agent_id,
+                    crate::cost_telemetry::RequestType::Chat,
+                    model,
+                    usage,
+                )
+                .await;
+        }
+    }
+
+    Ok(result_text)
+}
+
+/// Extract a human-readable detail from a `tool_use` content block's `input`.
+///
+/// Tries common field names: `file_path`, `path`, `command`, `pattern`, `query`.
+/// Returns the first match (truncated to 60 chars for display).
+pub(crate) fn extract_tool_detail(block: &serde_json::Value) -> Option<String> {
+    let input = block.get("input")?;
+    for key in &["file_path", "path", "command", "pattern", "query"] {
+        if let Some(val) = input.get(key).and_then(|v| v.as_str()) {
+            let truncated: String = val.chars().take(60).collect();
+            return Some(truncated);
+        }
+    }
+    None
+}
+
+// ── Phase 3.B: PTY-routed Claude CLI invocation ──────────────────────────────
+//
+// Mirror of `spawn_claude_cli_with_env` / `call_claude_cli_rotated`, but
+// routes the subprocess through [`crate::pty_runtime::invoke_oneshot`] so
+// the child sees a real PTY on every platform (ConPTY on Win 10 1809+,
+// openpty on Unix). Compared to the streaming variant this loses live
+// progress callbacks + keepalive heartbeats — those land in Phase 3.C
+// alongside long-lived session reuse. What we keep:
+//
+// - Identical command-line args (so account rotation env injection works the
+//   same way).
+// - `result` / `assistant` stream-json event handling (final answer + token
+//   usage extraction + `is_error` short-circuit).
+// - `cost_telemetry` recording on success.
+// - Same `Result<String, String>` shape so the call sites are drop-in
+//   replaceable when the wedge switches.
+
+/// Diagnostic counters extracted while parsing stream-json output. Embedded in
+/// error messages so post-mortem from `channel_failures.jsonl` is actionable.
+#[derive(Debug, Default)]
+pub(crate) struct StreamDiagnostics {
+    pub lines_seen: u32,
+    pub events_parsed: u32,
+    pub assistant_events: u32,
+    pub text_blocks: u32,
+    pub thinking_blocks: u32,
+    pub tool_use_blocks: u32,
+    pub result_events: u32,
+    pub last_raw_line: String,
+    pub last_result_subtype: Option<String>,
+    pub last_stop_reason: Option<String>,
+}
+
+impl StreamDiagnostics {
+    fn render(&self, exit_code: i32, stderr_tail: &str) -> String {
+        format!(
+            "exit={} lines={} events={} assistant={} text_blocks={} \
+             thinking={} tool_use={} result_events={} \
+             result_subtype={:?} stop_reason={:?} \
+             last_line={:?} stderr_tail={:?}",
+            exit_code,
+            self.lines_seen,
+            self.events_parsed,
+            self.assistant_events,
+            self.text_blocks,
+            self.thinking_blocks,
+            self.tool_use_blocks,
+            self.result_events,
+            self.last_result_subtype,
+            self.last_stop_reason,
+            self.last_raw_line,
+            stderr_tail,
+        )
+    }
+}
+
+/// Outcome of parsing a complete stream-json stdout dump.
+pub(crate) struct StreamParseResult {
+    /// The final answer text. May be empty on parser-level success (e.g. CLI
+    /// only emitted thinking blocks); caller decides whether that's an error.
+    pub text: String,
+    /// Token usage from the `result` event when present.
+    pub usage: Option<crate::cost_telemetry::TokenUsage>,
+    pub diagnostics: StreamDiagnostics,
+}
+
+/// Parse a complete stream-json stdout buffer (newline-delimited JSON events)
+/// in one shot. Mirrors the streaming loop in `spawn_claude_cli_with_env` but
+/// over a finished `&str` rather than an `AsyncBufRead`.
+///
+/// On a `result` event with `is_error: true`, returns `Err(...)` — same
+/// semantics as the streaming variant's mid-stream short-circuit. Same for
+/// assistant-level `error` field.
+pub(crate) fn parse_claude_stream_json_complete(
+    stdout: &str,
+) -> Result<StreamParseResult, String> {
+    let mut text = String::new();
+    let mut usage: Option<crate::cost_telemetry::TokenUsage> = None;
+    let mut diag = StreamDiagnostics::default();
+
+    for raw_line in stdout.split('\n') {
+        let line = raw_line.trim_end_matches('\r');
+        if line.trim().is_empty() {
+            continue;
+        }
+        diag.lines_seen += 1;
+        diag.last_raw_line = line.chars().take(400).collect();
+
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        diag.events_parsed += 1;
+
+        match event.get("type").and_then(|t| t.as_str()) {
+            Some("result") => {
+                diag.result_events += 1;
+                diag.last_result_subtype = event
+                    .get("subtype")
+                    .and_then(|s| s.as_str())
+                    .map(String::from);
+                if event
+                    .get("is_error")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    let err_text = event
+                        .get("result")
+                        .and_then(|r| r.as_str())
+                        .unwrap_or("Unknown stream-json error");
+                    return Err(format!("claude CLI stream error: {err_text}"));
+                }
+                if let Some(t) = event.get("result").and_then(|r| r.as_str()) {
+                    // Only overwrite with the result event's text when non-empty;
+                    // tool-use turns often have empty `result` because the real
+                    // answer landed in intermediate assistant text blocks.
+                    if !t.is_empty() {
+                        text = t.to_string();
+                    }
+                }
+                if let Some(usage_val) = event.get("usage") {
+                    usage = crate::cost_telemetry::TokenUsage::from_json(usage_val);
+                }
+            }
+            Some("assistant") => {
+                diag.assistant_events += 1;
+                if let Some(err) = event.get("error").and_then(|e| e.as_str()) {
+                    return Err(format!("claude CLI assistant error: {err}"));
+                }
+                if let Some(sr) = event
+                    .pointer("/message/stop_reason")
+                    .and_then(|v| v.as_str())
+                {
+                    diag.last_stop_reason = Some(sr.to_string());
+                }
+                if let Some(content) = event
+                    .pointer("/message/content")
+                    .and_then(|c| c.as_array())
+                {
+                    for block in content {
+                        match block.get("type").and_then(|t| t.as_str()) {
+                            Some("text") => {
+                                diag.text_blocks += 1;
+                                if let Some(t) =
+                                    block.get("text").and_then(|t| t.as_str())
+                                {
+                                    text = t.to_string();
+                                }
+                            }
+                            Some("thinking") => {
+                                diag.thinking_blocks += 1;
+                            }
+                            Some("tool_use") => {
+                                diag.tool_use_blocks += 1;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(StreamParseResult {
+        text,
+        usage,
+        diagnostics: diag,
+    })
+}
+
+/// Compose the args + env that the legacy `spawn_claude_cli_with_env`
+/// passes to `tokio::process::Command`. Extracted so the PTY variant can
+/// drive an identical CLI invocation.
+fn build_claude_cli_args(
+    user_message: &str,
+    model: &str,
+    claude_session_id: Option<&str>,
+    capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
+    work_dir: Option<&Path>,
+    system_prompt_file: Option<&Path>,
+) -> Vec<String> {
+    let mut args: Vec<String> = Vec::new();
+
+    if let Some(sid) = claude_session_id {
+        args.push("--resume".to_string());
+        args.push(sid.to_string());
+    }
+
+    args.extend([
+        "--exclude-dynamic-system-prompt-sections".to_string(),
+        "-p".to_string(),
+        user_message.to_string(),
+        "--model".to_string(),
+        model.to_string(),
+        "--output-format".to_string(),
+        "stream-json".to_string(),
+        "--verbose".to_string(),
+        "--dangerously-skip-permissions".to_string(),
+        "--max-turns".to_string(),
+        "50".to_string(),
+    ]);
+
+    let caps = capabilities.cloned().unwrap_or_default();
+    let denied = caps.disallowed_tools();
+    if !denied.is_empty() {
+        args.push("--disallowedTools".to_string());
+        args.push(denied.join(","));
+    }
+
+    if let Some(dir) = work_dir {
+        let mcp_json = dir.join(".mcp.json");
+        if mcp_json.exists() {
+            args.push("--mcp-config".to_string());
+            args.push(mcp_json.to_string_lossy().to_string());
+            args.push("--strict-mcp-config".to_string());
+        }
+    }
+
+    if let Some(sys_file) = system_prompt_file {
+        args.push("--system-prompt-file".to_string());
+        args.push(sys_file.to_string_lossy().to_string());
+    }
+
+    args
+}
+
+/// PTY-routed sibling of [`spawn_claude_cli_with_env`]. Spawns the `claude`
+/// CLI under a real PTY (ConPTY on Win, openpty on Unix), waits for the
+/// child to exit, then parses the captured stream-json stdout in one shot.
+///
+/// **Used by Phase 3.C.4 as the API-key fallback path.** OAuth accounts
+/// route through interactive `PtySession` (which works around Anthropic's
+/// `claude -p` OAuth block); API-key accounts still use this `-p` PTY
+/// wrapper, since the OAuth block doesn't affect API-key auth.
+#[allow(clippy::too_many_arguments)]
+async fn spawn_claude_cli_pty_with_env(
+    user_message: &str,
+    model: &str,
+    system_prompt: &str,
+    home_dir: &Path,
+    work_dir: Option<&Path>,
+    _on_progress: Option<&ProgressCallback>,
+    capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
+    env_vars: &std::collections::HashMap<String, String>,
+    claude_session_id: Option<&str>,
+) -> Result<String, String> {
+    let claude_path = duduclaw_core::which_claude()
+        .ok_or_else(|| "claude CLI not found in PATH".to_string())?;
+
+    // Install agent-file-guard hook (parity with the streaming variant). When
+    // work_dir is set, this is a per-agent dir; otherwise skip.
+    if let Some(dir) = work_dir {
+        let bin = crate::agent_hook_installer::resolve_duduclaw_bin();
+        if let Err(e) =
+            crate::agent_hook_installer::ensure_agent_hook_settings(dir, &bin).await
+        {
+            warn!(
+                agent_dir = %dir.display(),
+                error = %e,
+                "spawn_claude_cli_pty_with_env: agent-file-guard install failed — continuing"
+            );
+        }
+    }
+
+    // Pass system prompt via temp file (matches legacy path; cmdline-safe).
+    let prompt_guard: Option<tempfile::TempPath> = if !system_prompt.is_empty() {
+        match tempfile::NamedTempFile::new() {
+            Ok(mut f) => {
+                use std::io::Write;
+                let _ = f.write_all(system_prompt.as_bytes());
+                Some(f.into_temp_path())
+            }
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+    let system_prompt_path = prompt_guard.as_deref();
+
+    let args = build_claude_cli_args(
+        user_message,
+        model,
+        claude_session_id,
+        capabilities,
+        work_dir,
+        system_prompt_path,
+    );
+
+    // Assemble env: API key fallback → caps env vars → caller-provided
+    // rotator env → context propagation (REPLY_CHANNEL, turn/session ids,
+    // DELEGATION_ENV are task-local; mirror the legacy path).
+    let mut env: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let api_key = if env_vars.is_empty() {
+        get_api_key(home_dir).await
+    } else {
+        None
+    };
+    if let Some(ref key) = api_key {
+        env.insert("ANTHROPIC_API_KEY".to_string(), key.clone());
+    }
+
+    {
+        let caps = capabilities.cloned().unwrap_or_default();
+        if caps.browser_via_bash {
+            env.insert("DUDUCLAW_BROWSER_VIA_BASH".to_string(), "1".to_string());
+        }
+    }
+
+    // Caller-provided env wins. Empty value means "force-remove" — for
+    // portable-pty there's no env_remove primitive, but starting from an
+    // empty map (we only seed the keys we care about) means an empty value
+    // never gets inherited from the parent, so this is automatic.
+    for (k, v) in env_vars {
+        if v.is_empty() {
+            env.remove(k);
+        } else {
+            env.insert(k.clone(), v.clone());
+        }
+    }
+
+    // Same context-propagation env vars the legacy path sets.
+    if let Ok(channel) = crate::claude_runner::REPLY_CHANNEL.try_with(|ch| ch.clone()) {
+        env.insert(
+            duduclaw_core::ENV_REPLY_CHANNEL.to_string(),
+            channel,
+        );
+    }
+    if let Ok(Some(turn_id)) =
+        duduclaw_memory::feedback::CURRENT_TURN_ID.try_with(|t| t.clone())
+    {
+        env.insert(duduclaw_core::ENV_TRUST_TURN_ID.to_string(), turn_id);
+    }
+    if let Ok(Some(session_id)) =
+        duduclaw_memory::feedback::CURRENT_SESSION_ID.try_with(|s| s.clone())
+    {
+        env.insert(duduclaw_core::ENV_TRUST_SESSION_ID.to_string(), session_id);
+    }
+    // CLAUDECODE removal: portable-pty inherits the parent env, but we
+    // explicitly add an empty marker so any downstream code sees it as
+    // unset. We can't env_remove with portable-pty's CommandBuilder, so
+    // set to empty string — claude CLI treats empty as unset.
+    env.insert("CLAUDECODE".to_string(), String::new());
+
+    let work_dir_owned = work_dir.map(|p| p.to_path_buf());
+    let deadline = std::time::Duration::from_secs(HARD_MAX_TIMEOUT_SECS);
+    let output = match crate::pty_runtime::invoke_oneshot(
+        claude_path,
+        args,
+        env,
+        work_dir_owned,
+        deadline,
+    )
+    .await
+    {
+        Ok(out) => out,
+        Err(e) => {
+            return Err(format!("claude CLI PTY spawn error: {e}"));
+        }
+    };
+    drop(prompt_guard); // tempfile lives until here
+
+    let parsed = parse_claude_stream_json_complete(&output.stdout)?;
+    let text = parsed.text.trim().to_string();
+    if text.is_empty() {
+        let diag = parsed.diagnostics.render(0, "");
+        return Err(format!("Empty response from claude CLI PTY ({diag})"));
+    }
+
+    // Record cost telemetry — same pattern as the streaming variant.
+    if let (Some(usage), Ok(agent_id)) = (
+        parsed.usage.as_ref(),
+        crate::claude_runner::CHANNEL_REPLY_AGENT_ID.try_with(|id| id.clone()),
+    ) {
+        if !agent_id.is_empty()
+            && let Some(telemetry) = crate::cost_telemetry::get_telemetry()
+        {
+            telemetry
+                .record(
+                    &agent_id,
+                    crate::cost_telemetry::RequestType::Chat,
+                    model,
+                    usage,
+                )
+                .await;
+        }
+    }
+
+    Ok(text)
+}
+
+/// PTY-routed sibling of [`call_claude_cli_rotated`]. Walks the same account
+/// rotation primitive, with the spawn closure branched on auth method
+/// (Phase 3.C.4):
+///
+/// - **OAuth accounts** → [`crate::pty_runtime::acquire_and_invoke`] —
+///   the cross-platform interactive REPL driver. The whole point of
+///   3.C.4 is to keep OAuth users working after Anthropic blocked
+///   `claude -p` for OAuth subscriptions.
+/// - **API-key accounts** → [`spawn_claude_cli_pty_with_env`] — the
+///   Phase 3.B PTY-wrapped `claude -p` path, which still works fine
+///   for API keys.
+///
+/// Auth-method detection from `env_vars`:
+/// - The rotator emits `ANTHROPIC_API_KEY = ""` (empty) for OAuth
+///   accounts (forces OAuth keychain path, prevents stale API key
+///   leak). API-key accounts emit `ANTHROPIC_API_KEY = <hex secret>`.
+/// - `CLAUDE_CODE_OAUTH_TOKEN` presence is an additional positive
+///   signal for OAuth-via-setup-token accounts.
+pub(crate) async fn call_claude_cli_pty_rotated(
+    user_message: &str,
+    model: &str,
+    system_prompt: &str,
+    home_dir: &Path,
+    work_dir: Option<&Path>,
+    on_progress: Option<&ProgressCallback>,
+    capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
+    _session_id: Option<&str>,
+    conversation_history: &[ConversationTurn],
+) -> Result<String, String> {
+    let rotator = match crate::claude_runner::get_rotator_cached(home_dir).await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(error = %e, "PTY: rotator unavailable — falling back to PTY direct (no rotation)");
+            let effective_msg = if conversation_history.is_empty() {
+                user_message.to_string()
+            } else {
+                format_history_as_prompt(conversation_history, user_message)
+            };
+            return invoke_pty_branch(
+                &effective_msg,
+                model,
+                system_prompt,
+                home_dir,
+                work_dir,
+                on_progress,
+                capabilities,
+                &std::collections::HashMap::new(),
+            )
+            .await;
+        }
+    };
+
+    let account_count = rotator.count().await;
+    if account_count == 0 {
+        let effective_msg = if conversation_history.is_empty() {
+            user_message.to_string()
+        } else {
+            format_history_as_prompt(conversation_history, user_message)
+        };
+        return invoke_pty_branch(
+            &effective_msg,
+            model,
+            system_prompt,
+            home_dir,
+            work_dir,
+            on_progress,
+            capabilities,
+            &std::collections::HashMap::new(),
+        )
+        .await;
+    }
+
+    let input_len = user_message.len();
+    let history_clone = conversation_history.to_vec();
+    rotate_cli_spawn(
+        &rotator,
+        move |env_vars| {
+            let model = model.to_string();
+            let system_prompt = system_prompt.to_string();
+            let home_dir = home_dir.to_path_buf();
+            let work_dir = work_dir.map(|p| p.to_path_buf());
+            let on_progress = on_progress;
+            let capabilities = capabilities.cloned();
+            let history = history_clone.clone();
+            let user_message_owned = user_message.to_string();
+            async move {
+                let effective_prompt = if history.is_empty() {
+                    user_message_owned
+                } else {
+                    format_history_as_prompt(&history, &user_message_owned)
+                };
+                invoke_pty_branch(
+                    &effective_prompt,
+                    &model,
+                    &system_prompt,
+                    &home_dir,
+                    work_dir.as_deref(),
+                    on_progress,
+                    capabilities.as_ref(),
+                    &env_vars,
+                )
+                .await
+            }
+        },
+        input_len,
+    )
+    .await
+}
+
+/// Dispatch a single PTY-routed claude invocation, branching on the
+/// auth method gleaned from `env_vars`. See
+/// [`call_claude_cli_pty_rotated`] for the routing rationale.
+#[allow(clippy::too_many_arguments)]
+async fn invoke_pty_branch(
+    user_message: &str,
+    model: &str,
+    system_prompt: &str,
+    home_dir: &Path,
+    work_dir: Option<&Path>,
+    on_progress: Option<&ProgressCallback>,
+    capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
+    env_vars: &std::collections::HashMap<String, String>,
+) -> Result<String, String> {
+    if env_vars_indicate_oauth(env_vars) {
+        // OAuth → interactive REPL. The bootstrap protocol + sentinel
+        // pairing is owned by `PtySession`; we feed it the user message
+        // and let the pool reuse / respawn as needed.
+        let agent_id = agent_id_from_work_dir(work_dir);
+        let deadline = std::time::Duration::from_secs(HARD_MAX_TIMEOUT_SECS);
+        // Phase 3.D.2 — segregate pool sessions per OAuth account so
+        // multi-account rotation produces distinct sessions instead of
+        // sharing one (which silently pinned all accounts to whichever
+        // spawned first).
+        let account_id = account_id_from_env_vars(env_vars);
+        // **Review fix**: never log the OAuth token prefix — even 12
+        // hex chars is token-derived material. Log a hash-style tag
+        // for diagnostics (stable per account, no reverse-mapping).
+        let account_log_tag = account_id
+            .as_deref()
+            .map(account_log_tag)
+            .unwrap_or_else(|| "default".to_string());
+        info!(
+            agent_id = %agent_id,
+            account_tag = %account_log_tag,
+            model = %model,
+            "channel_reply: routing OAuth invoke through interactive PTY pool"
+        );
+        let _ = (system_prompt, home_dir, on_progress, capabilities);
+        // Round 4 deferred-cleanup (LOW F-3): use canonical options
+        // entry point instead of the 7-positional-arg legacy variant.
+        let acquire = crate::pty_runtime::AcquireOptions::new(
+            agent_id,
+            duduclaw_cli_runtime::CliKind::Claude,
+            false, // bare_mode
+        )
+        .account_id(account_id.as_deref())
+        .model(Some(model));
+        crate::pty_runtime::acquire_and_invoke_with(
+            crate::pty_runtime::InvokeOptions::new(acquire, user_message, deadline),
+        )
+        .await
+    } else {
+        // API key → legacy `-p` PTY-wrapped path (Phase 3.B).
+        info!("channel_reply: routing API-key invoke through `-p` PTY one-shot");
+        spawn_claude_cli_pty_with_env(
+            user_message,
+            model,
+            system_prompt,
+            home_dir,
+            work_dir,
+            on_progress,
+            capabilities,
+            env_vars,
+            None,
+        )
+        .await
+    }
+}
+
+/// Phase 3.D.2 — derive a stable PtyPool-keying identifier from the
+/// rotator-supplied `env_vars`.
+///
+/// We don't pass the full `AccountEnv.id` through `rotate_cli_spawn`'s
+/// closure (the closure signature is `Fn(HashMap)` for back-compat with
+/// the legacy `call_claude_cli_rotated`). Instead we derive a key from
+/// the env vars the rotator wrote — they're stable per account by
+/// construction:
+///
+/// - `CLAUDE_CODE_OAUTH_TOKEN` is account-specific → first 12 chars hex
+///   form a non-secret-leaking identifier.
+/// - `CLAUDE_CONFIG_DIR` (set when the account uses a non-default
+///   profile directory) maps 1-1 to the OAuth account.
+/// - Otherwise return `None` so the pool falls back to the default
+///   "shared session" behaviour.
+///
+/// **Security note**: returning the OAuth token prefix is intentional —
+/// it's hex characters, included in pool cache keys + diagnostic logs.
+/// A 12-char hex prefix has ~48 bits of entropy, far short of being a
+/// useful secret (the rotator stores the full token; only the gateway
+/// sees this prefix in its memory). It's NEVER logged to disk.
+fn account_id_from_env_vars(
+    env_vars: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    if let Some(token) = env_vars.get("CLAUDE_CODE_OAUTH_TOKEN")
+        && !token.is_empty()
+    {
+        return Some(format!("oauth-{}", &token[..token.len().min(12)]));
+    }
+    if let Some(dir) = env_vars.get("CLAUDE_CONFIG_DIR")
+        && !dir.is_empty()
+    {
+        return Some(format!("dir-{dir}"));
+    }
+    None
+}
+
+/// **Review fix (security)**: derive a non-secret-revealing tag for
+/// tracing / log lines from an account_id that may itself be token-
+/// derived (`oauth-<prefix>` form). We hash the input and emit a short
+/// hex digest so two log entries for the same account share a tag
+/// (operational debuggability) without leaking any prefix of the
+/// underlying token. SHA-256 truncated to 8 hex chars is sufficient for
+/// operational correlation without collision in a fleet of < 100
+/// accounts.
+fn account_log_tag(account_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(account_id.as_bytes());
+    let bytes = &digest[..4];
+    hex::encode(bytes)
+}
+
+/// True when `env_vars` was emitted for an OAuth account by the rotator
+/// (empty `ANTHROPIC_API_KEY` sentinel, or explicit
+/// `CLAUDE_CODE_OAUTH_TOKEN` presence).
+fn env_vars_indicate_oauth(env_vars: &std::collections::HashMap<String, String>) -> bool {
+    if env_vars.contains_key("CLAUDE_CODE_OAUTH_TOKEN") {
+        return true;
+    }
+    match env_vars.get("ANTHROPIC_API_KEY") {
+        Some(v) if v.is_empty() => true, // rotator's "force OAuth" sentinel
+        _ => false,
+    }
+}
+
+/// Extract the agent id from the last path component of `work_dir`. The
+/// PtyPool keys sessions by `(agent_id, cli_kind, bare_mode)`, so two
+/// agents with the same OAuth account still get their own session.
+fn agent_id_from_work_dir(work_dir: Option<&Path>) -> &'static str {
+    // We need a stable agent identifier that lives long enough for the
+    // PtyPool's cache_key. For simplicity, the pool key gets a 'static
+    // string identifier; we leak a small string per unique agent id
+    // (bounded by the number of agents, typically < 50).
+    //
+    // NOTE: this leak is acceptable because:
+    // 1. Agent ids are finite (< 50 typically),
+    // 2. They're stable across the gateway's lifetime,
+    // 3. The cost is ~50 × ~40 bytes = ~2 KB total.
+    //
+    // **Round 2 review fix (MED-7)**: warn ONCE per unique non-UTF8
+    // path, not on every call. The previous code emitted `warn!` on
+    // every channel_reply that hit a non-UTF8 work_dir, which would
+    // flood the log when one such agent runs hot. Now we maintain a
+    // small `seen_non_utf8` set; a path that's been warned about
+    // returns "default" silently afterwards.
+    static SEEN_NON_UTF8: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashSet<std::ffi::OsString>>,
+    > = std::sync::OnceLock::new();
+    let raw = match work_dir.and_then(|p| p.file_name()).map(|n| (n, n.to_str())) {
+        Some((_, Some(s))) => s,
+        Some((non_utf8, None)) => {
+            let already_warned = {
+                let seen = SEEN_NON_UTF8.get_or_init(|| {
+                    std::sync::Mutex::new(std::collections::HashSet::new())
+                });
+                let mut guard = seen.lock().unwrap_or_else(|p| p.into_inner());
+                !guard.insert(non_utf8.to_os_string())
+            };
+            if !already_warned {
+                warn!(
+                    file_name = %non_utf8.to_string_lossy(),
+                    "channel_reply: work_dir file_name is not valid UTF-8 — falling back to shared 'default' agent id (sessions will be pooled across these agents). This warning is one-shot per unique path."
+                );
+            }
+            "default"
+        }
+        None => "default",
+    };
+
+    static AGENT_ID_CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, &'static str>>,
+    > = std::sync::OnceLock::new();
+    // Round 4 deferred-cleanup (LOW F-4): cap the cache size so a
+    // pathological flood of distinct `work_dir` file_names (e.g. an
+    // attacker who can create directories with timestamped names)
+    // cannot grow the leaked-string set without bound. Past the cap
+    // we return the sentinel "default" and emit a one-shot warning
+    // — at that point session pooling degrades to shared-by-default,
+    // which is the same behaviour the function falls back to for
+    // non-UTF-8 file names today.
+    const AGENT_ID_CACHE_CAP: usize = 1024;
+    let cache = AGENT_ID_CACHE
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut guard = cache.lock().expect("agent_id cache poisoned");
+    if let Some(s) = guard.get(raw) {
+        return s;
+    }
+    if guard.len() >= AGENT_ID_CACHE_CAP {
+        // One-shot warning per process lifetime — the cap should
+        // never legitimately fire in production (< 50 agents in
+        // realistic deployments).
+        static SATURATED_WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        if SATURATED_WARNED.set(()).is_ok() {
+            warn!(
+                cap = AGENT_ID_CACHE_CAP,
+                "channel_reply: AGENT_ID_CACHE reached its cap; further unique work_dir names will collapse onto a shared 'default' agent id. \
+This likely indicates an attacker-controlled name flood or a config bug producing per-call random directories."
+            );
+        }
+        return "default";
+    }
+    let leaked: &'static str = Box::leak(raw.to_string().into_boxed_str());
+    guard.insert(raw.to_string(), leaked);
+    leaked
+}
+
+// ── Python SDK subprocess (fallback) ────────────────────────
+
+/// Find the Python source path for `duduclaw.sdk.chat`.
+fn find_python_path(home_dir: &Path) -> String {
+    find_python_path_static(home_dir)
+}
+
+/// Public version usable from other modules (e.g. handlers).
+pub fn find_python_path_static(home_dir: &Path) -> String {
+    // Try common locations
+    let mut candidates = vec![
+        // Installed via pip
+        String::new(), // use system PYTHONPATH
+        // Development: project root python/
+        home_dir
+            .parent()
+            .unwrap_or(home_dir)
+            .join("python")
+            .to_string_lossy()
+            .to_string(),
+    ];
+    #[cfg(not(windows))]
+    {
+        // Homebrew / source install
+        candidates.push("/opt/duduclaw".to_string());
+        // Homebrew Cellar (Apple Silicon)
+        candidates.push("/opt/homebrew/opt/duduclaw-pro/libexec/python".to_string());
+        // Homebrew Cellar (Intel Mac)
+        candidates.push("/usr/local/opt/duduclaw-pro/libexec/python".to_string());
+    }
+    #[cfg(windows)]
+    {
+        if let Ok(appdata) = std::env::var("LOCALAPPDATA") {
+            candidates.push(format!("{appdata}\\Programs\\duduclaw\\python"));
+        }
+    }
+    // User-local fallback
+    candidates.push(home_dir.join(".duduclaw").join("python").to_string_lossy().to_string());
+
+    for path in &candidates {
+        if !path.is_empty() && Path::new(path).join("duduclaw").exists() {
+            return path.clone();
+        }
+    }
+
+    // Fallback: return existing PYTHONPATH
+    std::env::var("PYTHONPATH").unwrap_or_default()
+}
+
+/// Delegate execution — spawn Python subprocess with a given prompt and return the response.
+pub async fn call_python_sdk_delegate(
+    prompt: &str,
+    model: &str,
+    system_prompt: &str,
+    home_dir: &Path,
+) -> Result<String, String> {
+    call_python_sdk_v2(prompt, model, system_prompt, home_dir, None).await
+}
+
+/// Call the Python Claude Code SDK via subprocess.
+///
+/// The Python SDK uses the `anthropic` package with the `AccountRotator`
+/// for multi-account rotation, budget tracking, and error recovery.
+///
+/// When `api_key` is provided, it is injected as `ANTHROPIC_API_KEY` env var
+/// into the subprocess so the Python SDK can authenticate even when
+/// `config.toml` has no `[[accounts]]` entries.
+async fn call_python_sdk_v2(
+    user_message: &str,
+    model: &str,
+    system_prompt: &str,
+    home_dir: &Path,
+    api_key: Option<&str>,
+) -> Result<String, String> {
+    use tokio::io::AsyncWriteExt;
+    use tokio::process::Command;
+
+    let prompt_file = home_dir.join(format!(".tmp_system_prompt_{}.md", uuid::Uuid::new_v4()));
+    tokio::fs::write(&prompt_file, system_prompt)
+        .await
+        .map_err(|e| format!("Write prompt: {e}"))?;
+
+    let config_path = home_dir.join("config.toml");
+    let python_path = find_python_path(home_dir);
+
+    let mut cmd = Command::new(duduclaw_core::platform::python3_command());
+    cmd.args([
+            "-m",
+            "duduclaw.sdk.chat",
+            "--model",
+            model,
+            "--system-prompt-file",
+            &prompt_file.to_string_lossy(),
+            "--config",
+            &config_path.to_string_lossy(),
+        ])
+        .env("PYTHONPATH", &python_path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    // Inject API key if provided by caller (from rotator or config).
+    if let Some(key) = api_key {
+        cmd.env("ANTHROPIC_API_KEY", key);
+    }
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Spawn python3: {e}"))?;
+
+    // Write user message to stdin
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(user_message.as_bytes())
+            .await
+            .map_err(|e| format!("Write stdin: {e}"))?;
+        drop(stdin); // close stdin to signal EOF
+    }
+
+    let output = child
+        .wait_with_output()
+        .await
+        .map_err(|e| format!("Wait: {e}"))?;
+
+    let _ = tokio::fs::remove_file(&prompt_file).await;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if !output.status.success() {
+        return Err(format!(
+            "exit {}: {}",
+            output.status.code().unwrap_or(-1),
+            stderr.chars().take(200).collect::<String>()
+        ));
+    }
+
+    if stdout.is_empty() {
+        return Err("Empty response".to_string());
+    }
+
+    Ok(stdout)
+}
+
+// ── Helpers ─────────────────────────────────────────────────
+
+/// Build system prompt with progressive skill injection.
+///
+/// When `compressed_skills` and `active_skills` are available, uses three-layer
+/// progressive loading instead of full injection. Otherwise falls back to legacy
+/// full injection.
+// `citation_ctx` carries `(agent_id, turn_id, session_id)` — when present,
+// wiki pages injected into the prompt are recorded into the global
+// `CitationTracker` so the prediction-error feedback bus can later attribute
+// trust deltas back to the exact pages that influenced this turn.
+// `session_id` is the SESSION-scoped budget id used for the per-conversation
+// cap (review BLOCKER R2-1). Distinct from `turn_id` which is the per-turn
+// drain key.
+/// RFC-21 §1 step 4: resolve the sender's identity through the configured
+/// [`duduclaw_identity::IdentityProvider`] and format the result as an
+/// XML-delimited `<sender>` block ready for prompt injection.
+///
+/// `session_id` carries the channel as its colon-prefix (`"discord:1234"`,
+/// `"line:U..."`, `"telegram:..."`, ...). Unknown channels degrade to
+/// [`duduclaw_identity::ChannelKind::Other`] — the resolver still works.
+///
+/// Returns an empty string when the sender is unknown or any provider error
+/// occurs. That matches v1.10.1 behaviour exactly, so this change is safe to
+/// land before any concrete upstream provider (Notion / LDAP) is configured.
+async fn build_sender_block(
+    home_dir: &std::path::Path,
+    session_id: &str,
+    user_id: &str,
+) -> String {
+    use duduclaw_identity::IdentityProvider;
+    use duduclaw_identity::providers::WikiCacheIdentityProvider;
+
+    if user_id.is_empty() {
+        return String::new();
+    }
+
+    let channel_str = session_id.split(':').next().unwrap_or("unknown");
+    let channel = duduclaw_identity::ChannelKind::parse_wire(channel_str);
+
+    let provider = WikiCacheIdentityProvider::for_home(home_dir.to_path_buf());
+    match provider.resolve_by_channel(channel.clone(), user_id).await {
+        Ok(Some(person)) => {
+            // Format as a tightly-bounded XML block; agents are trained to
+            // treat XML tags as ground-truth context the user cannot
+            // override (matches the security-hooks injection-resistance
+            // convention used elsewhere in DuDuClaw).
+            let mut block = String::with_capacity(256);
+            block.push_str("<sender>\n");
+            block.push_str(&format!("  <person_id>{}</person_id>\n", xml_escape(&person.person_id)));
+            block.push_str(&format!("  <display_name>{}</display_name>\n", xml_escape(&person.display_name)));
+            if !person.roles.is_empty() {
+                block.push_str(&format!(
+                    "  <roles>{}</roles>\n",
+                    xml_escape(&person.roles.join(", "))
+                ));
+            }
+            if !person.project_ids.is_empty() {
+                block.push_str(&format!(
+                    "  <project_ids>{}</project_ids>\n",
+                    xml_escape(&person.project_ids.join(", "))
+                ));
+            }
+            block.push_str(&format!("  <channel>{}</channel>\n", xml_escape(&channel.as_wire())));
+            block.push_str(&format!("  <source>{}</source>\n", xml_escape(provider.name())));
+            block.push_str("</sender>");
+            block
+        }
+        Ok(None) => String::new(),
+        Err(e) => {
+            tracing::warn!(
+                provider = provider.name(),
+                channel = %channel.as_wire(),
+                "build_sender_block: identity provider error: {}",
+                e,
+            );
+            String::new()
+        }
+    }
+}
+
+/// XML escape — keeps `<sender>` block well-formed even if a person record
+/// contains `<`, `&`, or quote characters.
+fn xml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '&' => out.push_str("&amp;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+fn build_system_prompt(
+    agent: Option<&duduclaw_agent::registry::LoadedAgent>,
+    user_message: Option<&str>,
+    compressed_skills: Option<&[crate::skill_lifecycle::compression::CompressedSkill]>,
+    active_skills: Option<&std::collections::HashSet<String>>,
+    skill_token_budget: u32,
+    team_members: Option<&[TeamMember]>,
+    pinned_instructions: &str,
+    citation_ctx: Option<(&str, &str, Option<&str>)>,
+    // RFC-21 §1: when the IdentityProvider resolved the message sender, the
+    // formatted `<sender>...</sender>` XML block is passed in here. Empty
+    // string means "no resolution" — agents fall back to treating the sender
+    // as a stranger, which matches v1.10.1 behaviour exactly.
+    sender_block: &str,
+) -> String {
+    // #11 (2026-05-12) — Minimal mode: short-circuit to the lean assembler.
+    // Agents opt in via `agent.toml [prompt] mode = "minimal"`. See
+    // commercial/docs/TODO-runtime-health-fixes-202605.md #11.
+    if let Some(a) = agent {
+        if a.config.prompt.mode == duduclaw_core::types::PromptMode::Minimal {
+            return crate::prompt_minimal::build_minimal_system_prompt(
+                a,
+                sender_block,
+                pinned_instructions,
+            );
+        }
+    }
+
+    let mut parts = Vec::new();
+    // Mirror parts with labelled byte counts for the prompt-size audit log.
+    // See `crate::prompt_audit` — emitted only when total exceeds the
+    // 50KB threshold so it stays silent on normal traffic but lights up
+    // exactly the requests that risk hitting the 200K cliff.
+    let mut audit: Vec<crate::prompt_audit::PromptSection> = Vec::new();
+
+    if let Some(a) = agent {
+        if let Some(soul) = &a.soul {
+            audit.push(crate::prompt_audit::PromptSection::new("soul", soul));
+            parts.push(soul.clone());
+        }
+        if let Some(identity) = &a.identity {
+            audit.push(crate::prompt_audit::PromptSection::new("identity", identity));
+            parts.push(identity.clone());
+        }
+
+        // RFC-22 P1-9a / P1-8: inject CONTRACT.toml boundaries (must_not /
+        // must_always) into the channel system prompt. runner.rs already
+        // injects this for sub-agent dispatch but channel_reply did not,
+        // which is why 5/5 agnes hallucinated a PM section after pm spawn
+        // failed — there was no rule visible to LLM forbidding proxy authoring.
+        let contract_prompt =
+            duduclaw_agent::contract::contract_to_prompt(&a.contract);
+        if !contract_prompt.is_empty() {
+            audit.push(crate::prompt_audit::PromptSection::new(
+                "contract",
+                &contract_prompt,
+            ));
+            parts.push(contract_prompt);
+        }
+
+        // Progressive skill injection (when available)
+        let mut skills_total_bytes: usize = 0;
+        if let (Some(skills), Some(msg)) = (compressed_skills, user_message) {
+            if !skills.is_empty() {
+                let active = active_skills.cloned().unwrap_or_default();
+
+                // Layer 0: all skill names
+                let index: Vec<&str> = skills.iter().map(|s| s.tag.as_str()).collect();
+                let s = format!("Available skills: {}", index.join(", "));
+                skills_total_bytes += s.len();
+                parts.push(s);
+
+                // Rank and select layers
+                let ranked = crate::skill_lifecycle::relevance::rank_skills(msg, skills);
+                let config = crate::skill_lifecycle::relevance::RelevanceConfig::default();
+                let selection = crate::skill_lifecycle::relevance::select_layers(
+                    &ranked, &active, skills, &config,
+                );
+
+                let mut remaining_budget = skill_token_budget;
+
+                // Layer 2: active + highly relevant — full content
+                for &idx in &selection.layer2 {
+                    let skill = &skills[idx];
+                    if remaining_budget >= skill.tokens_layer2 {
+                        let s = format!("## Skill: {}\n{}", skill.name, skill.full_content);
+                        skills_total_bytes += s.len();
+                        parts.push(s);
+                        remaining_budget = remaining_budget.saturating_sub(skill.tokens_layer2);
+                    }
+                }
+
+                // Layer 1: relevant — summary only
+                for &idx in &selection.layer1 {
+                    let skill = &skills[idx];
+                    if remaining_budget >= skill.tokens_layer1 {
+                        let s = format!("## {}: {}", skill.name, skill.summary);
+                        skills_total_bytes += s.len();
+                        parts.push(s);
+                        remaining_budget = remaining_budget.saturating_sub(skill.tokens_layer1);
+                    }
+                }
+            }
+        } else {
+            // Legacy: inject all skills fully (backward compat when
+            // progressive not enabled). #6.2b: cap at
+            // DEFAULT_LEGACY_SKILL_BYTE_CAP so an unbounded SKILLS/ dir
+            // can't push the prompt past the 200K cliff. Truncation
+            // footer (when triggered) explains what was dropped and
+            // points operators at progressive injection.
+            let pairs: Vec<(String, String)> = a
+                .skills
+                .iter()
+                .map(|s| (s.name.clone(), s.content.clone()))
+                .collect();
+            let (rendered, footer) = crate::prompt_audit::budgeted_legacy_skills(
+                &pairs,
+                crate::prompt_audit::DEFAULT_LEGACY_SKILL_BYTE_CAP,
+            );
+            for s in rendered {
+                skills_total_bytes += s.len();
+                parts.push(s);
+            }
+            if let Some(note) = footer {
+                skills_total_bytes += note.len();
+                parts.push(note);
+            }
+        }
+        if skills_total_bytes > 0 {
+            audit.push(crate::prompt_audit::PromptSection {
+                label: "skills",
+                bytes: skills_total_bytes,
+            });
+        }
+    }
+
+    // RFC-21 §1: inject the `<sender>` block so SOUL.md rules like
+    // "reject non-project members" become evaluable from data the agent
+    // already has, instead of requiring a mid-reasoning shared_wiki_read
+    // lookup. XML-delimited per the security-hooks injection-resistance
+    // convention — the block is placed before team / wiki context so the
+    // agent reads "who am I talking to" before "what do I know".
+    if !sender_block.is_empty() {
+        audit.push(crate::prompt_audit::PromptSection::new(
+            "sender",
+            sender_block,
+        ));
+        parts.push(sender_block.to_string());
+    }
+
+    // Inject sub-agent team roster so the agent knows its organizational context.
+    // This enables natural delegation: "請團隊檢查" → agent knows which sub-agents to use.
+    if let Some(members) = team_members {
+        if !members.is_empty() {
+            let mut team_section = String::from("## Your Team\nYou have the following sub-agents. Use `spawn_agent` or `send_to_agent` MCP tools to delegate tasks to them.\n");
+            for m in members {
+                team_section.push_str(&format!("- **{}** ({}) — {}\n", m.display_name, m.name, m.role));
+            }
+            audit.push(crate::prompt_audit::PromptSection::new(
+                "team",
+                &team_section,
+            ));
+            parts.push(team_section);
+        }
+    }
+
+    // Wiki knowledge injection — L0 (Identity) + L1 (Core) pages are always
+    // injected so the agent can reference accumulated wiki knowledge without
+    // manual wiki_search calls. L2/L3 are search-only.
+    //
+    // #14 glue (2026-05-12): when we have the user_message, rank pages by
+    // TF-IDF relevance and keep top-K under the 6 KB budget instead of
+    // dumping in file order. The empty-query path falls back to file
+    // order via `relevance_ranker`'s fast path, matching prior behaviour.
+    if let Some(a) = agent {
+        let wiki_dir = a.dir.join("wiki");
+        if wiki_dir.exists() {
+            let store = duduclaw_memory::WikiStore::new(wiki_dir);
+            let query = user_message.unwrap_or("");
+            // Hoist the Arc<CitationTracker> binding so the borrow lives
+            // long enough for the CitationContext. The tracker itself is
+            // a global singleton — cheap to clone the Arc.
+            let tracker_arc = citation_ctx.map(|_| duduclaw_memory::feedback::global_tracker());
+            let citation_context =
+                citation_ctx.zip(tracker_arc.as_ref()).map(
+                    |((agent_id, conv_id, session_id), tracker)| {
+                        crate::ranked_wiki_injection::CitationContext {
+                            agent_id,
+                            conversation_id: conv_id,
+                            session_id,
+                            tracker: tracker.as_ref(),
+                        }
+                    },
+                );
+            let wiki_ctx = crate::ranked_wiki_injection::ranked_wiki_injection(
+                &store,
+                query,
+                6000,
+                citation_context,
+            );
+            // The helper returns "" on error or no pages — wrap the
+            // non-empty case identically to before so prompt shape
+            // stays stable for prompt-cache hits.
+            let result: Result<String, duduclaw_core::error::DuDuClawError> = Ok(wiki_ctx);
+            match result {
+                Ok(wiki_ctx) if !wiki_ctx.is_empty() => {
+                    let s = format!("## Wiki Knowledge\n{}", wiki_ctx.trim_end());
+                    audit.push(crate::prompt_audit::PromptSection::new("wiki", &s));
+                    parts.push(s);
+                }
+                Ok(_) => {} // no L0/L1 pages
+                Err(e) => {
+                    tracing::warn!("Wiki injection failed: {e}");
+                }
+            }
+        }
+    }
+
+    // Instruction Pinning: inject at the END of system prompt (Anthropic best practice:
+    // "put instructions at the bottom for best attention"). This combats U-shaped
+    // attention degradation by placing key task requirements in the high-attention tail.
+    if !pinned_instructions.is_empty() {
+        let s = format!(
+            "## Pinned Task Instructions\n\
+             The user's core task requirements (ALWAYS follow these throughout the conversation):\n\
+             {pinned_instructions}"
+        );
+        audit.push(crate::prompt_audit::PromptSection::new("pinned", &s));
+        parts.push(s);
+    }
+
+    let agent_label = agent
+        .map(|a| a.config.agent.name.as_str())
+        .unwrap_or("unknown");
+    crate::prompt_audit::maybe_log_breakdown(
+        agent_label,
+        "channel_reply",
+        &audit,
+        crate::prompt_audit::DEFAULT_EMIT_THRESHOLD_BYTES,
+    );
+
+    if parts.is_empty() {
+        "You are DuDuClaw, a helpful AI assistant. Reply concisely in the user's language."
+            .to_string()
+    } else {
+        parts.join("\n\n---\n\n")
+    }
+}
+
+/// Read the default_agent from config.toml [general] section.
+async fn get_default_agent(home_dir: &Path) -> Option<String> {
+    let config_path = home_dir.join("config.toml");
+    let content = tokio::fs::read_to_string(&config_path).await.ok()?;
+    let table: toml::Table = content.parse().ok()?;
+    let general = table.get("general")?.as_table()?;
+    let name = general.get("default_agent")?.as_str()?;
+    if name.is_empty() { None } else { Some(name.to_string()) }
+}
+
+/// Estimate the token count for a piece of text.
+///
+/// Uses a CJK-aware heuristic:
+/// - CJK characters (U+3000–U+9FFF and supplementary ranges): ~1.5 chars/token
+/// - ASCII words: ~4 chars/token
+/// - Mixed: weighted average
+///
+/// This is significantly more accurate than the naive `len / 4` for Chinese,
+/// Japanese, and Korean text, which is the primary language of this application.
+fn estimate_tokens(text: &str) -> u32 {
+    let mut cjk_chars: u32 = 0;
+    let mut other_chars: u32 = 0;
+
+    for ch in text.chars() {
+        let cp = ch as u32;
+        if (0x3000..=0x9FFF).contains(&cp)
+            || (0xF900..=0xFAFF).contains(&cp)
+            || (0x20000..=0x2A6DF).contains(&cp)
+            || (0x2A700..=0x2CEAF).contains(&cp)
+        {
+            cjk_chars += 1;
+        } else {
+            other_chars += 1;
+        }
+    }
+
+    // CJK: ~1.5 chars per token; other: ~4 chars per token
+    let cjk_tokens = (cjk_chars as f32 / 1.5).ceil() as u32;
+    let other_tokens = (other_chars as f32 / 4.0).ceil() as u32;
+    cjk_tokens + other_tokens + 1 // +1 minimum
+}
+
+/// Parse session_id "telegram:12345" or "telegram:12345:thread" into (channel, chat_id).
+fn parse_session_id_parts(session_id: &str) -> (&str, &str) {
+    let parts: Vec<&str> = session_id.splitn(3, ':').collect();
+    match parts.len() {
+        0 | 1 => ("", session_id),
+        _ => (parts[0], parts[1]),
+    }
+}
+
+async fn get_api_key(home_dir: &Path) -> Option<String> {
+    // Environment variable takes precedence
+    if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
+        if !key.is_empty() {
+            return Some(key);
+        }
+    }
+    // Try encrypted config field, fallback to plaintext
+    crate::config_crypto::read_encrypted_config_field(home_dir, "api", "anthropic_api_key").await
+}
+
+/// Heuristic: does the user's message look like a computer use request?
+///
+/// Matches keywords in Chinese, English, and Japanese that indicate the
+/// user wants the agent to interact with the desktop GUI.
+fn looks_like_computer_use_request(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    // Chinese keywords
+    let cn = ["打開", "開啟", "點擊", "截圖", "螢幕", "桌面", "滑鼠",
+              "鍵盤", "操作電腦", "幫我開", "幫我點", "幫我按",
+              "幫我打", "幫我填", "幫我輸入", "幫我關", "視窗",
+              "列印", "下載", "安裝"];
+    // English keywords
+    let en = ["open app", "click on", "take screenshot", "on my screen",
+              "on my desktop", "mouse", "keyboard", "type into",
+              "fill the form", "close the window", "print the",
+              "download the", "install the", "open the browser",
+              "control my computer", "on my computer"];
+    // Japanese keywords
+    let jp = ["画面", "クリック", "開いて", "入力して", "スクリーンショット"];
+
+    cn.iter().any(|kw| lower.contains(&kw.to_lowercase()))
+        || en.iter().any(|kw| lower.contains(kw))
+        || jp.iter().any(|kw| lower.contains(&kw.to_lowercase()))
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// RFC-21 §1 step 4 — sender block construction
+// ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod sender_block_tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn write_identity_record(home: &std::path::Path, filename: &str, frontmatter: &str) {
+        let dir = home
+            .join("shared")
+            .join("wiki")
+            .join("identity")
+            .join("people");
+        fs::create_dir_all(&dir).unwrap();
+        let body = format!("---\n{frontmatter}---\n");
+        fs::write(dir.join(filename), body).unwrap();
+    }
+
+    #[test]
+    fn xml_escape_handles_metacharacters() {
+        assert_eq!(xml_escape("plain"), "plain");
+        assert_eq!(xml_escape("<tag>"), "&lt;tag&gt;");
+        assert_eq!(xml_escape("a & b"), "a &amp; b");
+        assert_eq!(xml_escape("she said \"hi\""), "she said &quot;hi&quot;");
+        assert_eq!(xml_escape("it's"), "it&apos;s");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn empty_user_id_returns_empty_block() {
+        let tmp = TempDir::new().unwrap();
+        let block = build_sender_block(tmp.path(), "discord:chat-1", "").await;
+        assert!(block.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unknown_sender_returns_empty_block_no_regression() {
+        // No identity records present → resolver returns Ok(None) →
+        // build_sender_block must return "" so v1.10.1 behaviour is preserved.
+        let tmp = TempDir::new().unwrap();
+        let block = build_sender_block(tmp.path(), "discord:chat-1", "9999999").await;
+        assert!(block.is_empty(), "got: {block}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn known_sender_renders_xml_block_with_full_record() {
+        let tmp = TempDir::new().unwrap();
+        write_identity_record(
+            tmp.path(),
+            "ruby.md",
+            "person_id: person_2f9\n\
+             display_name: Ruby Lin\n\
+             roles: [customer-pm, project-lead]\n\
+             project_ids: [proj-alpha]\n\
+             channel_handles:\n  discord: \"1234567890\"\n",
+        );
+
+        let block = build_sender_block(tmp.path(), "discord:chat-1", "1234567890").await;
+        assert!(block.starts_with("<sender>"), "got: {block}");
+        assert!(block.ends_with("</sender>"), "got: {block}");
+        assert!(block.contains("<person_id>person_2f9</person_id>"), "got: {block}");
+        assert!(block.contains("<display_name>Ruby Lin</display_name>"), "got: {block}");
+        assert!(block.contains("<roles>customer-pm, project-lead</roles>"), "got: {block}");
+        assert!(block.contains("<project_ids>proj-alpha</project_ids>"), "got: {block}");
+        assert!(block.contains("<channel>discord</channel>"), "got: {block}");
+        assert!(block.contains("<source>wiki-cache</source>"), "got: {block}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn xml_metacharacters_in_record_are_escaped() {
+        let tmp = TempDir::new().unwrap();
+        // Display name contains characters that would break XML if unescaped.
+        write_identity_record(
+            tmp.path(),
+            "weird.md",
+            "person_id: person_w\n\
+             display_name: \"<weird & co>\"\n\
+             channel_handles:\n  discord: \"42\"\n",
+        );
+
+        let block = build_sender_block(tmp.path(), "discord:c", "42").await;
+        assert!(block.contains("&lt;weird &amp; co&gt;"), "got: {block}");
+        // Sanity: must still be a single, well-formed `<sender>` envelope.
+        assert_eq!(block.matches("<sender>").count(), 1);
+        assert_eq!(block.matches("</sender>").count(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unknown_channel_falls_through_to_other_variant() {
+        let tmp = TempDir::new().unwrap();
+        write_identity_record(
+            tmp.path(),
+            "matrix-user.md",
+            "person_id: person_mx\n\
+             display_name: Matrix User\n\
+             channel_handles:\n  matrix: \"@user:example.org\"\n",
+        );
+
+        // 'matrix:' prefix isn't a built-in channel kind — must still resolve.
+        let block = build_sender_block(tmp.path(), "matrix:room-1", "@user:example.org").await;
+        assert!(block.contains("<person_id>person_mx</person_id>"), "got: {block}");
+        assert!(block.contains("<channel>matrix</channel>"), "got: {block}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn omits_optional_blocks_when_record_lacks_them() {
+        let tmp = TempDir::new().unwrap();
+        // Minimal record — no roles, no projects.
+        write_identity_record(
+            tmp.path(),
+            "minimal.md",
+            "person_id: person_bare\n\
+             display_name: Bare Bones\n\
+             channel_handles:\n  discord: \"77\"\n",
+        );
+
+        let block = build_sender_block(tmp.path(), "discord:c", "77").await;
+        assert!(block.contains("<person_id>person_bare</person_id>"));
+        assert!(!block.contains("<roles>"), "should omit empty roles, got: {block}");
+        assert!(!block.contains("<project_ids>"), "should omit empty project_ids, got: {block}");
+    }
+}
+
+// Phase 3.B parser tests ──────────────────────────────────────────────────
+#[cfg(test)]
+mod stream_json_parser_tests {
+    use super::parse_claude_stream_json_complete;
+
+    fn line_event(json: &str) -> String {
+        format!("{json}\n")
+    }
+
+    #[test]
+    fn parses_result_event_text() {
+        let stdout = line_event(
+            r#"{"type":"result","subtype":"success","result":"the final answer"}"#,
+        );
+        let parsed = parse_claude_stream_json_complete(&stdout).unwrap();
+        assert_eq!(parsed.text, "the final answer");
+        assert_eq!(parsed.diagnostics.result_events, 1);
+        assert_eq!(parsed.diagnostics.events_parsed, 1);
+        assert_eq!(parsed.diagnostics.last_result_subtype.as_deref(), Some("success"));
+    }
+
+    #[test]
+    fn falls_back_to_assistant_text_when_result_empty() {
+        let stdout = String::new()
+            + &line_event(
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"intermediate"}]}}"#,
+            )
+            + &line_event(r#"{"type":"result","subtype":"success","result":""}"#);
+        let parsed = parse_claude_stream_json_complete(&stdout).unwrap();
+        // Empty result event must not overwrite assistant text — same
+        // behaviour as the streaming variant in spawn_claude_cli_with_env.
+        assert_eq!(parsed.text, "intermediate");
+        assert_eq!(parsed.diagnostics.text_blocks, 1);
+        assert_eq!(parsed.diagnostics.assistant_events, 1);
+    }
+
+    #[test]
+    fn extracts_token_usage_from_result_event() {
+        let stdout = line_event(
+            r#"{"type":"result","subtype":"success","result":"hi","usage":{"input_tokens":10,"output_tokens":20,"cache_creation_input_tokens":5,"cache_read_input_tokens":3}}"#,
+        );
+        let parsed = parse_claude_stream_json_complete(&stdout).unwrap();
+        let usage = parsed.usage.expect("usage must be present");
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 20);
+    }
+
+    #[test]
+    fn short_circuits_on_is_error_result_event() {
+        let stdout = line_event(
+            r#"{"type":"result","subtype":"error_max_turns","is_error":true,"result":"Not logged in"}"#,
+        );
+        let err = parse_claude_stream_json_complete(&stdout)
+            .err()
+            .expect("must error");
+        assert!(err.contains("Not logged in"), "got: {err}");
+    }
+
+    #[test]
+    fn short_circuits_on_assistant_error_field() {
+        let stdout = line_event(
+            r#"{"type":"assistant","error":"oauth token expired","message":{"content":[]}}"#,
+        );
+        let err = parse_claude_stream_json_complete(&stdout)
+            .err()
+            .expect("must error");
+        assert!(err.contains("oauth token expired"), "got: {err}");
+    }
+
+    #[test]
+    fn handles_crlf_line_endings() {
+        let stdout = format!(
+            "{evt}\r\n",
+            evt = r#"{"type":"result","subtype":"success","result":"crlf-payload"}"#
+        );
+        let parsed = parse_claude_stream_json_complete(&stdout).unwrap();
+        assert_eq!(parsed.text, "crlf-payload");
+    }
+
+    #[test]
+    fn ignores_blank_lines_and_invalid_json() {
+        let stdout = String::new()
+            + "\n"
+            + "not-json-at-all\n"
+            + &line_event(r#"{"type":"result","subtype":"success","result":"valid"}"#)
+            + "  \n"
+            + "{ truncated json...\n";
+        let parsed = parse_claude_stream_json_complete(&stdout).unwrap();
+        assert_eq!(parsed.text, "valid");
+        assert!(parsed.diagnostics.events_parsed >= 1);
+    }
+
+    #[test]
+    fn counts_block_types_for_diagnostics() {
+        let stdout = String::new()
+            + &line_event(
+                r#"{"type":"assistant","message":{"stop_reason":"tool_use","content":[{"type":"thinking","thinking":"..."},{"type":"tool_use","name":"Bash","input":{"command":"ls"}},{"type":"text","text":"answer"}]}}"#,
+            )
+            + &line_event(r#"{"type":"result","subtype":"success","result":"answer"}"#);
+        let parsed = parse_claude_stream_json_complete(&stdout).unwrap();
+        assert_eq!(parsed.diagnostics.thinking_blocks, 1);
+        assert_eq!(parsed.diagnostics.tool_use_blocks, 1);
+        assert_eq!(parsed.diagnostics.text_blocks, 1);
+        assert_eq!(parsed.diagnostics.last_stop_reason.as_deref(), Some("tool_use"));
+    }
+
+    #[test]
+    fn handles_cjk_payload_safely() {
+        let stdout = line_event(
+            r#"{"type":"result","subtype":"success","result":"你好世界 🐾"}"#,
+        );
+        let parsed = parse_claude_stream_json_complete(&stdout).unwrap();
+        assert_eq!(parsed.text, "你好世界 🐾");
+    }
+
+    #[test]
+    fn returns_empty_text_when_no_events_present() {
+        let parsed = parse_claude_stream_json_complete("").unwrap();
+        assert_eq!(parsed.text, "");
+        assert_eq!(parsed.diagnostics.events_parsed, 0);
+    }
+}
+
+// Phase 3.C.4 routing-helper tests ────────────────────────────────────────
+//
+// These unit tests replace the manual "gray rollout" validation step by
+// pinning the two pure functions that decide which spawn path a CLI call
+// takes (`env_vars_indicate_oauth`, `agent_id_from_work_dir`). The
+// remaining production glue (`acquire_and_invoke` + `invoke_pty_branch`)
+// is exercised end-to-end by the `claude_interactive_spike` example
+// binary against a real `claude` binary — that's the operator-facing
+// smoke harness.
+#[cfg(test)]
+mod routing_helper_tests {
+    use super::{account_id_from_env_vars, agent_id_from_work_dir, env_vars_indicate_oauth};
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    #[test]
+    fn env_vars_indicate_oauth_detects_setup_token_account() {
+        let mut env = HashMap::new();
+        env.insert(
+            "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
+            "sk-oauth-fake".to_string(),
+        );
+        // Rotator still emits empty API_KEY alongside the token to force
+        // the keychain off; presence of CLAUDE_CODE_OAUTH_TOKEN is the
+        // dominant positive signal.
+        env.insert("ANTHROPIC_API_KEY".to_string(), String::new());
+        assert!(env_vars_indicate_oauth(&env));
+    }
+
+    #[test]
+    fn env_vars_indicate_oauth_detects_keychain_account_via_empty_api_key() {
+        // Default OAuth account: rotator sets ANTHROPIC_API_KEY = ""
+        // (the "force keychain" sentinel) and no CLAUDE_CODE_OAUTH_TOKEN.
+        let mut env = HashMap::new();
+        env.insert("ANTHROPIC_API_KEY".to_string(), String::new());
+        assert!(env_vars_indicate_oauth(&env));
+    }
+
+    #[test]
+    fn env_vars_indicate_oauth_rejects_api_key_account() {
+        let mut env = HashMap::new();
+        env.insert(
+            "ANTHROPIC_API_KEY".to_string(),
+            "sk-ant-real-key-value".to_string(),
+        );
+        assert!(!env_vars_indicate_oauth(&env));
+    }
+
+    #[test]
+    fn env_vars_indicate_oauth_rejects_empty_env() {
+        // Empty env_vars (no rotator / fresh-install path) is treated as
+        // "not OAuth" so the call falls through to the `-p` PTY path,
+        // which uses ambient auth (API key from config or env).
+        let env: HashMap<String, String> = HashMap::new();
+        assert!(!env_vars_indicate_oauth(&env));
+    }
+
+    #[test]
+    fn agent_id_from_work_dir_extracts_last_segment() {
+        let p = PathBuf::from("/home/user/.duduclaw/agents/agnes");
+        let id = agent_id_from_work_dir(Some(&p));
+        assert_eq!(id, "agnes");
+    }
+
+    #[test]
+    fn agent_id_from_work_dir_returns_default_when_none() {
+        let id = agent_id_from_work_dir(None);
+        assert_eq!(id, "default");
+    }
+
+    // Phase 3.D.2 — account-id derivation tests.
+
+    #[test]
+    fn account_id_from_env_vars_uses_oauth_token_prefix() {
+        let mut env = HashMap::new();
+        env.insert(
+            "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
+            "abcdef0123456789babababa".to_string(),
+        );
+        let id = account_id_from_env_vars(&env).expect("must derive");
+        assert_eq!(id, "oauth-abcdef012345");
+        assert!(id.starts_with("oauth-"));
+        // Confirm we don't leak the full token through the cache key.
+        assert!(!id.contains("babababa"));
+    }
+
+    #[test]
+    fn account_id_from_env_vars_uses_config_dir_when_token_absent() {
+        let mut env = HashMap::new();
+        env.insert("ANTHROPIC_API_KEY".to_string(), String::new());
+        env.insert(
+            "CLAUDE_CONFIG_DIR".to_string(),
+            "/home/user/.claude/profiles/work".to_string(),
+        );
+        let id = account_id_from_env_vars(&env).expect("must derive");
+        assert!(id.starts_with("dir-"));
+        assert!(id.contains("profiles/work"));
+    }
+
+    #[test]
+    fn account_id_from_env_vars_returns_none_for_default_keychain() {
+        // Default OAuth keychain account: rotator emits empty
+        // ANTHROPIC_API_KEY but no token + no profile dir.
+        let mut env = HashMap::new();
+        env.insert("ANTHROPIC_API_KEY".to_string(), String::new());
+        assert!(account_id_from_env_vars(&env).is_none());
+    }
+
+    #[test]
+    fn account_id_from_env_vars_returns_none_for_empty_env() {
+        let env: HashMap<String, String> = HashMap::new();
+        assert!(account_id_from_env_vars(&env).is_none());
+    }
+
+    #[test]
+    fn account_id_from_env_vars_token_prefix_is_stable() {
+        // The same token → same derived id. Different tokens → different ids.
+        let mut env_a = HashMap::new();
+        env_a.insert(
+            "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
+            "tokenA1234567xyz".to_string(),
+        );
+        let mut env_b = HashMap::new();
+        env_b.insert(
+            "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
+            "tokenB1234567xyz".to_string(),
+        );
+        let id_a1 = account_id_from_env_vars(&env_a).unwrap();
+        let id_a2 = account_id_from_env_vars(&env_a).unwrap();
+        let id_b = account_id_from_env_vars(&env_b).unwrap();
+        assert_eq!(id_a1, id_a2);
+        assert_ne!(id_a1, id_b);
+    }
+
+    #[test]
+    fn agent_id_from_work_dir_caches_static_strings_per_id() {
+        let p = PathBuf::from("/home/user/.duduclaw/agents/duduclaw-tl");
+        let id1 = agent_id_from_work_dir(Some(&p));
+        let id2 = agent_id_from_work_dir(Some(&p));
+        // Cached &'static — the two references must point to the same
+        // memory so the PtyPool's HashMap key is stable across calls.
+        assert!(std::ptr::eq(id1.as_ptr(), id2.as_ptr()));
+    }
+}
+

@@ -1,0 +1,57 @@
+/target
+**/*.rs.bk
+*.pdb
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.env
+*.key
+*.db
+*.db-shm
+*.db-wal
+.venv/
+node_modules/
+crates/duduclaw-dashboard/dist/
+
+# Internal tools (not for public distribution)
+tools/license-keygen/
+
+# Claude Code local config & hooks
+.claude/
+
+# Commercial closed-source modules (not pushed to public repo)
+commercial/
+
+# Python test coverage databases
+.coverage
+**/.coverage
+
+# Rust llvm-cov instrumentation profiles (created during cargo test --no-fail-fast)
+*.profraw
+**/*.profraw
+
+# Agent-generated daily reports (per-agent operational logs, not for repo)
+docs/tl/daily-report-*.md
+docs/pm/daily-report-*.md
+
+# Researcher agent local notes (auto-generated, mirrored to shared wiki)
+/research/
+
+# Active spike workspaces — promoted to production code on completion
+/python/spikes/
+
+# Python uv lock — only tracked once Python deliverables are first-class
+/uv.lock
+
+# Release artifacts (built by CI, not committed to source)
+artifacts/
+
+# Platform-specific pre-built binaries (published via npm, not git)
+npm/darwin-x64/bin/
+npm/darwin-arm64/bin/
+npm/linux-x64/bin/
+npm/linux-arm64/bin/
+npm/win32-x64/bin/

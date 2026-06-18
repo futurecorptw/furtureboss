@@ -1,0 +1,20 @@
+{
+  "name": "@duduclaw/win32-x64",
+  "version": "1.18.0",
+  "description": "DuDuClaw CE binary for Windows x64",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/zhixuli0406/DuDuClaw.git",
+    "directory": "npm/win32-x64"
+  },
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}

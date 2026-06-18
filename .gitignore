@@ -1,7 +1,17 @@
 # deps & build artifacts
 node_modules/
-duduclaw-fork/crates/
-duduclaw-fork/web/dist/
+**/target/
+**/dist/
 **/tsconfig.tsbuildinfo
 *.log
 .DS_Store
+
+# secrets / local config
+.env
+*.key
+*.pem
+.claude/
+
+# closed-source placeholder (keep the dir marker only)
+duduclaw-fork/commercial/*
+!duduclaw-fork/commercial/.gitkeep

@@ -1,0 +1,192 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v1.8.1)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            artifact: duduclaw-darwin-arm64
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            artifact: duduclaw-darwin-x64
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: duduclaw-linux-x64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: duduclaw-linux-arm64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            artifact: duduclaw-windows-x64
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross (aarch64-linux)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: cargo install cross --locked
+
+      - name: Build frontend
+        run: cd web && npm ci --legacy-peer-deps && npm run build
+
+      - name: Build binary (cross-compile — skip desktop feature, Wayland unavailable in cross)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: cross build --release --target ${{ matrix.target }} -p duduclaw-cli -p duduclaw-gateway --no-default-features --features duduclaw-gateway/dashboard,duduclaw-cli/dashboard,duduclaw-gateway/vendored-openssl
+        env:
+          PKG_CONFIG_ALLOW_CROSS: 1
+
+      - name: Build binary (macOS/Windows — with desktop feature)
+        if: matrix.target != 'aarch64-unknown-linux-gnu' && runner.os != 'Linux'
+        run: cargo build --release --target ${{ matrix.target }} -p duduclaw-cli -p duduclaw-gateway --features duduclaw-gateway/dashboard,duduclaw-gateway/desktop,duduclaw-cli/dashboard
+
+      - name: Build binary (Linux x64 — no desktop, uses L5a container mode)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo build --release --target ${{ matrix.target }} -p duduclaw-cli -p duduclaw-gateway --no-default-features --features duduclaw-gateway/dashboard,duduclaw-cli/dashboard
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p _pkg
+          cp target/${{ matrix.target }}/release/duduclaw _pkg/
+          cp -r python _pkg/python
+          cd _pkg
+          tar czf ../${{ matrix.artifact }}.tar.gz duduclaw python
+          cd ..
+          shasum -a 256 ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256
+          rm -rf _pkg
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          New-Item -ItemType Directory -Force -Path _pkg
+          Copy-Item target/${{ matrix.target }}/release/duduclaw.exe _pkg/
+          Copy-Item -Recurse python _pkg/python
+          cd _pkg
+          7z a ../${{ matrix.artifact }}.zip duduclaw.exe python
+          cd ..
+          Get-FileHash ${{ matrix.artifact }}.zip -Algorithm SHA256 | Format-List Hash > ${{ matrix.artifact }}.zip.sha256
+          Remove-Item -Recurse -Force _pkg
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            duduclaw-*.tar.gz
+            duduclaw-*.zip
+            duduclaw-*.sha256
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          generate_release_notes: true
+          files: |
+            duduclaw-*.tar.gz
+            duduclaw-*.zip
+            duduclaw-*.sha256
+
+  # Publish to npm
+  npm-publish:
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: artifacts
+
+      - name: Prepare and publish npm packages
+        if: env.HAS_TOKEN == 'true'
+        env:
+          HAS_TOKEN: ${{ secrets.NPM_TOKEN != '' }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          ARTIFACTS_DIR: ./artifacts
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION="${TAG#v}"
+          ./npm/scripts/publish.sh "$VERSION"
+
+  # Publish Python SDK to PyPI
+  pypi-publish:
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write  # Required for PyPI Trusted Publisher (OIDC)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build Python package
+        run: |
+          pip install build
+          python -m build
+
+      - name: Publish to PyPI (Trusted Publisher)
+        if: env.HAS_PYPI == 'true'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        # Uses OIDC Trusted Publisher — no API token needed.
+        # Set up at: https://pypi.org/manage/project/duduclaw/settings/publishing/
+        # Add GitHub publisher: zhixuli0406/DuDuClaw, workflow: release.yml, environment: (blank)
+        with:
+          skip-existing: true
+
+      - name: Publish to PyPI (token fallback)
+        if: env.HAS_PYPI != 'true' && env.HAS_TOKEN == 'true'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_TOKEN }}
+          skip-existing: true
+        env:
+          HAS_TOKEN: ${{ secrets.PYPI_TOKEN != '' }}
+
+    env:
+      HAS_PYPI: ${{ vars.PYPI_TRUSTED_PUBLISHER == 'true' }}
+

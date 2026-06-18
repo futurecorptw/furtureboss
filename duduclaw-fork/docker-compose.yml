@@ -1,0 +1,67 @@
+services:
+  duduclaw:
+    build:
+      context: .
+      dockerfile: container/Dockerfile.server
+    container_name: duduclaw-server
+    restart: unless-stopped
+    ports:
+      - "18789:18789"
+    volumes:
+      - duduclaw-data:/home/duduclaw/.duduclaw
+      - duduclaw-claude:/home/duduclaw/.claude
+      - duduclaw-codex:/home/duduclaw/.codex
+      - duduclaw-gemini:/home/duduclaw/.gemini
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      # Claude: OAuth token (preferred — from `claude setup-token`) or API key fallback
+      - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      # Codex (OpenAI): API key fallback — ChatGPT Plus/Pro OAuth lives in duduclaw-codex volume
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      # Gemini (Google): API key fallback — Google OAuth lives in duduclaw-gemini volume
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - DUDUCLAW_BIND=0.0.0.0
+      - LINE_CHANNEL_TOKEN=${LINE_CHANNEL_TOKEN:-}
+      - LINE_CHANNEL_SECRET=${LINE_CHANNEL_SECRET:-}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN:-}
+    depends_on:
+      watchtower:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:18789/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  watchtower:
+    image: containrrr/watchtower:1.7.1  # Pin to specific version
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - WATCHTOWER_CLEANUP=true
+      - WATCHTOWER_POLL_INTERVAL=3600
+      - WATCHTOWER_SCOPE=duduclaw
+    labels:
+      - "com.centurylinklabs.watchtower.scope=duduclaw"
+
+  tailscale:
+    # TODO: Pin to digest for production deployments
+    # Example: image: tailscale/tailscale:v1.78.3@sha256:abc123...
+    image: tailscale/tailscale:latest
+    hostname: duduclaw
+    environment:
+      - TS_AUTHKEY=${TS_AUTHKEY:-}
+      - TS_STATE_DIR=/var/lib/tailscale
+    volumes:
+      - tailscale-state:/var/lib/tailscale
+    profiles:
+      - tailscale
+
+volumes:
+  duduclaw-data:
+  duduclaw-claude:
+  duduclaw-codex:
+  duduclaw-gemini:
+  tailscale-state:
