@@ -330,10 +330,25 @@ type CronTaskItem = {
   enabled: boolean;
   last_run_at?: string | null;
   last_status?: string | null;
+  cron_timezone?: string | null;
 };
 
 /** Backend RPCs identify cron tasks by `id`; `name` is display-only. */
 const cronTaskId = (t: CronTaskItem) => t.id ?? t.name ?? '';
+
+/** Cron 表達式的判讀時區。空字串 = UTC（後端 legacy 預設）。
+ *  新增時預設台北，避免使用者填了本地時間卻被當成 UTC（issue：排程不觸發）。 */
+const CRON_TZ_DEFAULT = 'Asia/Taipei';
+const CRON_TZ_OPTIONS: ReadonlyArray<{ value: string; label: string }> = [
+  { value: 'Asia/Taipei', label: '台北 (Asia/Taipei, UTC+8)' },
+  { value: 'Asia/Tokyo', label: '東京 (Asia/Tokyo, UTC+9)' },
+  { value: 'Asia/Shanghai', label: '上海 (Asia/Shanghai, UTC+8)' },
+  { value: 'Asia/Hong_Kong', label: '香港 (Asia/Hong_Kong, UTC+8)' },
+  { value: 'America/Los_Angeles', label: '洛杉磯 (America/Los_Angeles)' },
+  { value: 'America/New_York', label: '紐約 (America/New_York)' },
+  { value: 'Europe/London', label: '倫敦 (Europe/London)' },
+  { value: '', label: 'UTC（不指定時區）' },
+];
 
 function CronEditDialog({
   task,
@@ -349,6 +364,7 @@ function CronEditDialog({
   const [schedule, setSchedule] = useState(task.schedule ?? task.cron ?? '');
   const [agent, setAgent] = useState(task.agent_id);
   const [body, setBody] = useState(task.task ?? '');
+  const [timezone, setTimezone] = useState(task.cron_timezone ?? '');
   const [saving, setSaving] = useState(false);
 
   const handleSave = async () => {
@@ -359,6 +375,7 @@ function CronEditDialog({
         agent_id: agent.trim() || undefined,
         cron: schedule.trim() || undefined,
         task: body.trim() || undefined,
+        cron_timezone: timezone,
       });
       toast.success(intl.formatMessage({ id: 'common.saved' }));
       await onSaved();
@@ -378,6 +395,13 @@ function CronEditDialog({
         </FormField>
         <FormField label={intl.formatMessage({ id: 'settings.cron.schedule' })} htmlFor="cron-edit-schedule" hint="m h dom mon dow">
           <input id="cron-edit-schedule" type="text" value={schedule} onChange={(e) => setSchedule(e.target.value)} className={cn(inputClass, 'font-mono')} placeholder="0 * * * *" />
+        </FormField>
+        <FormField label={intl.formatMessage({ id: 'settings.cron.timezone' })} htmlFor="cron-edit-timezone">
+          <select id="cron-edit-timezone" value={timezone} onChange={(e) => setTimezone(e.target.value)} className={inputClass}>
+            {CRON_TZ_OPTIONS.map((tz) => (
+              <option key={tz.value || 'utc'} value={tz.value}>{tz.label}</option>
+            ))}
+          </select>
         </FormField>
         <FormField label={intl.formatMessage({ id: 'settings.cron.agent' })} htmlFor="cron-edit-agent">
           <input id="cron-edit-agent" type="text" value={agent} onChange={(e) => setAgent(e.target.value)} className={inputClass} />
@@ -407,6 +431,7 @@ export function CronTab() {
   const [newSchedule, setNewSchedule] = useState('0 * * * *');
   const [newAgent, setNewAgent] = useState('');
   const [newTask, setNewTask] = useState('');
+  const [newTimezone, setNewTimezone] = useState(CRON_TZ_DEFAULT);
   const [adding, setAdding] = useState(false);
 
   const reportError = useCallback(
@@ -438,12 +463,14 @@ export function CronTab() {
         agent_id: newAgent.trim() || 'default',
         cron: newSchedule.trim(),
         task: newTask.trim() || undefined,
+        cron_timezone: newTimezone || undefined,
       });
       setShowAdd(false);
       setNewName('');
       setNewSchedule('0 * * * *');
       setNewAgent('');
       setNewTask('');
+      setNewTimezone(CRON_TZ_DEFAULT);
       await fetchTasks();
     } catch (e) {
       reportError(e);
@@ -511,10 +538,20 @@ export function CronTab() {
       {/* Add task form */}
       {showAdd && (
         <div className="mb-4 rounded-xl border border-amber-400/30 bg-amber-100/30 p-4 backdrop-blur dark:border-amber-500/20 dark:bg-amber-900/15">
-          <div className="grid gap-3 sm:grid-cols-3">
+          <div className="grid gap-3 sm:grid-cols-2">
             <input type="text" placeholder={intl.formatMessage({ id: 'settings.cron.name' })} value={newName} onChange={(e) => setNewName(e.target.value)} className={inputStyle} />
             <input type="text" placeholder="0 * * * *" value={newSchedule} onChange={(e) => setNewSchedule(e.target.value)} className={cn(inputStyle, 'font-mono')} />
             <input type="text" placeholder={intl.formatMessage({ id: 'settings.cron.agent' })} value={newAgent} onChange={(e) => setNewAgent(e.target.value)} className={inputStyle} />
+            <select
+              value={newTimezone}
+              onChange={(e) => setNewTimezone(e.target.value)}
+              className={inputStyle}
+              title={intl.formatMessage({ id: 'settings.cron.timezone' })}
+            >
+              {CRON_TZ_OPTIONS.map((tz) => (
+                <option key={tz.value || 'utc'} value={tz.value}>{tz.label}</option>
+              ))}
+            </select>
           </div>
           <textarea
             rows={2}
@@ -578,6 +615,9 @@ export function CronTab() {
                       <code className="rounded bg-stone-100 px-2 py-0.5 font-mono text-xs text-stone-600 dark:bg-stone-800 dark:text-stone-400">
                         {taskCron}
                       </code>
+                      <span className="ml-2 text-xs text-stone-400 dark:text-stone-500">
+                        {task.cron_timezone || 'UTC'}
+                      </span>
                     </td>
                     <td className="py-2 text-center">
                       {task.enabled ? (

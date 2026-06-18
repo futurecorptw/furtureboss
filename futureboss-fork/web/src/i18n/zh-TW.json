@@ -501,6 +501,7 @@
   "settings.cron.add": "新增排程",
   "settings.cron.name": "任務名稱",
   "settings.cron.schedule": "Cron 表達式",
+  "settings.cron.timezone": "時區",
   "settings.cron.agent": "指定 Agent",
   "settings.cron.action": "動作",
   "settings.cron.enabled": "啟用",

@@ -1,5 +1,5 @@
 // DuDuClaw Dashboard skin proxy（fork 前端供應版）
-// - 供應「我們自己 build 的 fork 前端」(duduclaw-fork .../dist)：index.html + /assets/*
+// - 供應「我們自己 build 的 fork 前端」(futureboss-fork .../dist)：index.html + /assets/*
 //   → 內含原生新增的「Boss 設定」頁面/路由/選單項
 // - 其餘請求（/ws 升級、/health、API…）轉發本機 gateway（沿用安裝的 v1.20.0）
 // - 仍套用 skin.css 注入 + text-replace.json 文字替換 + 貓圖路由
@@ -17,7 +17,7 @@ const UPSTREAM_PORT = Number(process.env.DUDU_UPSTREAM_PORT || 18789);
 const LISTEN_PORT = Number(process.env.DUDU_SKIN_PORT || 18790);
 const SKIN_PATH = path.join(__dirname, 'skin.css');
 const REPLACE_PATH = path.join(__dirname, 'text-replace.json');
-const DIST = path.join(__dirname, '..', 'duduclaw-fork', 'crates', 'duduclaw-dashboard', 'dist');
+const DIST = path.join(__dirname, '..', 'futureboss-fork', 'crates', 'duduclaw-dashboard', 'dist');
 
 function loadSkin() {
   try { return fs.readFileSync(SKIN_PATH, 'utf8'); }
@@ -76,6 +76,15 @@ function serveIndexHtml(cres) {
       return;
     }
     html = applyReplacements(html);
+    // 強制 light 為預設：bundle 為 type=module（deferred），會晚於 classic inline script，
+    // 故先寫入 theme-store 的 localStorage key，使啟動時 storedTheme() 回傳 'light'。
+    // proxy 自供的 HTML 不帶 CSP，inline script 可執行。
+    const forceLight =
+      `<script>try{localStorage.setItem('duduclaw-theme','light');` +
+      `document.documentElement.classList.remove('dark');}catch(e){}</script>`;
+    html = html.includes('</head>')
+      ? html.replace('</head>', `${forceLight}\n</head>`)
+      : forceLight + html;
     const style = `<style id="dudu-skin">\n${loadSkin()}\n</style>`;
     html = html.includes('</head>') ? html.replace('</head>', `${style}\n</head>`) : style + html;
     cres.writeHead(200, {

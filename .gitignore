@@ -13,5 +13,5 @@ node_modules/
 .claude/
 
 # closed-source placeholder (keep the dir marker only)
-duduclaw-fork/commercial/*
-!duduclaw-fork/commercial/.gitkeep
+futureboss-fork/commercial/*
+!futureboss-fork/commercial/.gitkeep

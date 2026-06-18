@@ -501,6 +501,7 @@
   "settings.cron.add": "Add Task",
   "settings.cron.name": "Task Name",
   "settings.cron.schedule": "Cron Expression",
+  "settings.cron.timezone": "Timezone",
   "settings.cron.agent": "Agent",
   "settings.cron.action": "Action",
   "settings.cron.enabled": "Enabled",

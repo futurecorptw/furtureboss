@@ -1033,9 +1033,10 @@ export const api = {
           enabled: boolean;
           last_run_at?: string | null;
           last_status?: string | null;
+          cron_timezone?: string | null;
         }>;
       }>,
-    add: (params: { name: string; agent_id: string; cron: string; task?: string }) =>
+    add: (params: { name: string; agent_id: string; cron: string; task?: string; cron_timezone?: string }) =>
       client.call('cron.add', params),
     update: (
       id: string,
@@ -1045,6 +1046,7 @@ export const api = {
         cron?: string;
         task?: string;
         enabled?: boolean;
+        cron_timezone?: string;
       }
     ) => client.call('cron.update', { id, ...params }),
     pause: (id: string) =>

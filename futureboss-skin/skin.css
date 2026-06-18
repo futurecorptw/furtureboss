@@ -22,6 +22,7 @@ aside a[href="/security"],     /* 安全設定 */
 aside a[href="/wiki-trust"],   /* Wiki Trust */
 aside a[href="/skills"],       /* Skill 市場 */
 aside a[href="/tasks"],        /* 任務看板 */
+aside a[href="/marketplace"],  /* 應用市集（無作用，隱藏） */
 aside a[href="/odoo"],         /* Odoo ERP */
 aside a[href="/agents"] {      /* Agent 設定（改用 Boss 設定 進入） */
   display: none !important;
@@ -201,6 +202,35 @@ div.gap-1.rounded-lg.bg-stone-100 > button.bg-amber-500 {
   color: #0A0A0A !important;
   font-weight: 600 !important;
   border-bottom-color: #0A0A0A !important;
+}
+
+/* ---- 10. 額外隱藏選單項 ---- */
+/* 側欄：分析報表 / AI 首席特助（Boss 設定） */
+aside a[href="/reports"],
+aside a[href="/boss"] {
+  display: none !important;
+}
+
+/* 系統設定 tab：一般設定 / 容器引擎 / 自動化 / 系統更新 / 瀏覽器自動化
+   （tab 按鈕無 id，以內部 lucide icon 辨識，scope 於設定頁 tab 容器） */
+div.gap-1.rounded-lg.bg-stone-100 > button:has(> svg.lucide-settings),    /* 一般設定 */
+div.gap-1.rounded-lg.bg-stone-100 > button:has(> svg.lucide-container),   /* 容器引擎 */
+div.gap-1.rounded-lg.bg-stone-100 > button:has(> svg.lucide-workflow),    /* 自動化 */
+div.gap-1.rounded-lg.bg-stone-100 > button:has(> svg.lucide-download),    /* 系統更新 */
+div.gap-1.rounded-lg.bg-stone-100 > button:has(> svg.lucide-globe) {      /* 瀏覽器自動化 */
+  display: none !important;
+}
+
+/* Header：新版本通知 banner（含向上箭頭 icon） */
+header > div:has(> svg.lucide-circle-arrow-up) {
+  display: none !important;
+}
+
+/* Header：外觀模式切換鈕（已強制 light，隱藏 icon 避免進 dark 撞色） */
+header button:has(> svg.lucide-sun),
+header button:has(> svg.lucide-moon),
+header button:has(> svg.lucide-monitor) {
+  display: none !important;
 }
 
 /* ---- 9. WebChat：把 🐾 換成「打電腦的貓」 ---- */

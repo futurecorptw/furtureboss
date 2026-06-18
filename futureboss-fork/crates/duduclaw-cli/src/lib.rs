@@ -1769,11 +1769,18 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
 
         let display: String = Input::new()
             .with_prompt("助理名稱")
-            .default("DuDu".to_string())
+            .default("AI 首席特助".to_string())
             .interact_text()
-            .unwrap_or_else(|_| "DuDu".to_string());
+            .unwrap_or_else(|_| "AI 首席特助".to_string());
 
-        let name = display.to_lowercase().replace(' ', "-");
+        // Derive a filesystem/namespace-safe agent id from the display name.
+        // Non-ASCII display names (e.g. 中文) fall back to a clean default id.
+        let mut name = display.to_lowercase().replace(' ', "-");
+        if name.is_empty()
+            || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            name = "boss".to_string();
+        }
 
         let trigger: String = Input::new()
             .with_prompt("觸發詞")
@@ -1804,7 +1811,7 @@ async fn cmd_onboard(skip_prompts: bool) -> duduclaw_core::error::Result<()> {
 
         (name, display, trigger, soul)
     } else {
-        ("dudu".to_string(), "DuDu".to_string(), "@DuDu".to_string(), String::new())
+        ("boss".to_string(), "AI 首席特助".to_string(), "@boss".to_string(), String::new())
     };
 
     // ── 4. Channels (advanced mode) ──────────────────────────
