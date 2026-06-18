@@ -1,6 +1,6 @@
 # FutureBoss
 
-**Version 1.0.0**
+**Version 1.1.0**
 
 FutureBoss 是以 [DuDuClaw](https://github.com/zhixuli0406/DuDuClaw)（v1.20.0，Apache 2.0）為基礎客製化的 AI Agent 控制台，外觀參考 [Genspark](https://www.genspark.ai)，並調整為「單人使用」的精簡介面。
 
@@ -57,6 +57,17 @@ node proxy.js        # 預設 http://localhost:18790
 ### 環境變數（proxy.js）
 - `DUDU_UPSTREAM_HOST` / `DUDU_UPSTREAM_PORT`：gateway 位址（預設 `127.0.0.1:18789`）
 - `DUDU_SKIN_PORT`：代理埠（預設 `18790`）
+
+---
+
+## 更新紀錄
+
+### v1.1.0
+- **連線錯誤處理**：gateway 未啟動/無法連線時，登入與記憶等頁面改為顯示清楚的中文提示（HTTP 狀態），不再出現難以理解的 `Unexpected token` 解析錯誤（`auth-store.ts` 新增防禦性 JSON 解析）。
+- 對應更新 `LoginPage` / `MemoryPage` / `BossSettingsPage` 與三語（zh-TW / en / ja-JP）介面字串。
+
+### v1.0.0
+- 首版：genspark 風格客製、貓老闆品牌、單人化精簡介面、Boss 設定與排程任務頁。
 
 ---
 

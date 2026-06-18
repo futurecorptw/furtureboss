@@ -33,14 +33,14 @@ export function LoginPage() {
         {/* Logo */}
         <div className="mb-8 text-center">
           <span
-            className="inline-grid h-16 w-16 place-items-center rounded-2xl bg-gradient-to-b from-amber-400 to-amber-500 text-3xl shadow-[0_8px_32px_-8px_rgba(245,158,11,0.7),inset_0_1px_0_0_rgba(255,255,255,0.4)]"
+            className="inline-grid h-32 w-32 place-items-center rounded-2xl bg-gradient-to-b from-amber-400 to-amber-500 text-6xl shadow-[0_8px_32px_-8px_rgba(245,158,11,0.7),inset_0_1px_0_0_rgba(255,255,255,0.4)]"
             role="img"
             aria-label="paw"
           >
             🐾
           </span>
           <h1 className="mt-4 text-2xl font-semibold tracking-tight text-stone-900 dark:text-stone-50">
-            DuDuClaw
+            FutureBoss
           </h1>
           <p className="mt-1 text-sm text-stone-500 dark:text-stone-400">
             {intl.formatMessage({ id: 'login.subtitle' })}

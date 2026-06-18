@@ -183,7 +183,7 @@ function MemoriesTab() {
             >
               <div className="mb-2 flex items-center justify-between">
                 <span className="text-xs font-medium text-amber-600 dark:text-amber-400">
-                  {entry.agent_id}
+                  {agents.find((a) => a.name === entry.agent_id)?.display_name || entry.agent_id}
                 </span>
                 <span className="flex items-center gap-1 text-xs text-stone-400 dark:text-stone-500">
                   <Clock className="h-3 w-3" />
@@ -372,9 +372,24 @@ interface EvolutionAgent {
   observation_period_hours: number;
 }
 
+// Friendly labels for the backend evolution mode (avoids surfacing raw
+// snake_case engine identifiers like "prediction_driven" to end users).
+const MODE_LABELS: Record<string, string> = {
+  prediction_driven: '智慧自動',
+  observe: '觀察模式',
+  observe_only: '觀察模式',
+  shadow: '觀察模式',
+  off: '已關閉',
+  disabled: '已關閉',
+  auto: '全自動',
+  active: '全自動',
+  manual: '手動',
+};
+
 function EvolutionTab() {
   const intl = useIntl();
   const [agents, setAgents] = useState<EvolutionAgent[]>([]);
+  const [nameMap, setNameMap] = useState<Record<string, string>>({});
   const [mode, setMode] = useState('');
   const [enabled, setEnabled] = useState(false);
   const [gvuEnabledCount, setGvuEnabledCount] = useState(0);
@@ -398,7 +413,9 @@ function EvolutionTab() {
     Promise.all([
       api.evolution.status().catch(onFailure),
       api.evolution.history(undefined, 20).catch(onFailure),
-    ]).then(([status, history]) => {
+      // Resolve internal agent ids (e.g. "boss") to friendly display names.
+      api.agents.list().catch(() => null),
+    ]).then(([status, history, agentList]) => {
       setAgents(status?.agents ?? []);
       setMode(status?.mode ?? '');
       setEnabled(status?.enabled ?? false);
@@ -406,8 +423,14 @@ function EvolutionTab() {
       setTotalVersions(status?.total_versions ?? 0);
       setLastAppliedAt(status?.last_applied_at ?? null);
       setVersions(history?.versions ?? []);
+      const map: Record<string, string> = {};
+      for (const a of agentList?.agents ?? []) map[a.name] = a.display_name || a.name;
+      setNameMap(map);
     }).finally(() => setLoading(false));
   }, [intl]);
+
+  const displayName = (id: string) => nameMap[id] ?? id;
+  const modeLabel = MODE_LABELS[mode] ?? mode.replace(/_/g, ' ');
 
   return (
     <div className="space-y-4">
@@ -428,7 +451,7 @@ function EvolutionTab() {
               'text-sm',
               enabled ? 'text-amber-700 dark:text-amber-400' : 'text-stone-500 dark:text-stone-400',
             )}>
-              {intl.formatMessage({ id: 'evolution.mode' })}: <strong>{mode.replace('_', ' ')}</strong>
+              {intl.formatMessage({ id: 'evolution.mode' })}: <strong>{modeLabel}</strong>
             </span>
           </div>
           <span className="text-xs text-stone-500 dark:text-stone-400">
@@ -436,7 +459,7 @@ function EvolutionTab() {
           </span>
           {totalVersions > 0 && (
             <span className="text-xs text-stone-500 dark:text-stone-400">
-              · {totalVersions} versions
+              · {totalVersions} {intl.formatMessage({ id: 'evolution.versions' })}
             </span>
           )}
           {lastAppliedAt && (
@@ -470,12 +493,12 @@ function EvolutionTab() {
                 <div className="rounded-lg bg-amber-100 p-2 dark:bg-amber-900/30">
                   <GitBranch className="h-4 w-4 text-amber-600 dark:text-amber-400" />
                 </div>
-                <h3 className="font-semibold text-stone-900 dark:text-stone-50">{agent.agent_id}</h3>
+                <h3 className="font-semibold text-stone-900 dark:text-stone-50">{displayName(agent.agent_id)}</h3>
               </div>
 
               <div className="space-y-2 text-sm">
                 <EvolutionRow
-                  label="GVU"
+                  label={intl.formatMessage({ id: 'evolution.gvu' })}
                   enabled={agent.gvu_enabled}
                 />
                 <EvolutionRow
@@ -531,7 +554,7 @@ function EvolutionTab() {
           ) : (
             <div className="space-y-2">
               {versions.map((v) => (
-                <EvolutionVersionCard key={v.version_id} version={v} />
+                <EvolutionVersionCard key={v.version_id} version={v} displayName={displayName(v.agent_id)} />
               ))}
             </div>
           )}
@@ -541,7 +564,7 @@ function EvolutionTab() {
   );
 }
 
-function EvolutionVersionCard({ version }: { version: EvolutionVersion }) {
+function EvolutionVersionCard({ version, displayName }: { version: EvolutionVersion; displayName: string }) {
   const intl = useIntl();
 
   const statusLabel = (() => {
@@ -581,7 +604,7 @@ function EvolutionVersionCard({ version }: { version: EvolutionVersion }) {
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex items-center gap-2">
           <span className="text-sm font-medium text-amber-600 dark:text-amber-400">
-            {version.agent_id}
+            {displayName}
           </span>
           <span className={cn(
             'rounded-full px-2 py-0.5 text-[10px] font-medium',
@@ -589,7 +612,6 @@ function EvolutionVersionCard({ version }: { version: EvolutionVersion }) {
           )}>
             {statusLabel}
           </span>
-          <code className="text-[10px] text-stone-400">{version.soul_hash.slice(0, 8)}</code>
         </div>
         <span className="flex items-center gap-1 text-xs text-stone-400">
           <Clock className="h-3 w-3" />
@@ -712,7 +734,7 @@ function InsightsTab() {
                 <div className="flex items-center gap-2">
                   <Lightbulb className="h-4 w-4 text-amber-500 dark:text-amber-400" />
                   <span className="text-xs font-medium text-amber-600 dark:text-amber-400">
-                    {fact.agent_id}
+                    {agents.find((a) => a.name === fact.agent_id)?.display_name || fact.agent_id}
                   </span>
                   {fact.access_count > 0 && (
                     <span className="inline-flex items-center rounded-full bg-amber-50 px-2 py-0.5 text-[10px] font-medium text-amber-700 dark:bg-amber-900/30 dark:text-amber-400">

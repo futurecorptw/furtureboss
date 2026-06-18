@@ -80,13 +80,28 @@ function startRefreshTimer(refresh: () => Promise<void>) {
   }
 }
 
+// Parse a JSON response defensively. A down/unreachable gateway makes the skin
+// proxy return a plaintext 502 ("skin proxy upstream error: ..."); calling
+// res.json() on that throws an opaque "Unexpected token" SyntaxError. Read the
+// body as text first and surface a clear, actionable message instead.
+async function readJson(res: Response): Promise<{ error?: string; [k: string]: unknown }> {
+  const text = await res.text();
+  try {
+    return text ? JSON.parse(text) : {};
+  } catch {
+    throw new Error(
+      res.ok ? '伺服器回應格式錯誤，請稍後再試' : `無法連線到伺服器 (HTTP ${res.status})，請確認服務是否啟動`,
+    );
+  }
+}
+
 async function apiPost<T>(path: string, body: Record<string, unknown>): Promise<T> {
   const res = await fetch(path, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
-  const data = await res.json();
+  const data = await readJson(res);
   if (!res.ok) {
     throw new Error(data.error || `HTTP ${res.status}`);
   }
@@ -97,7 +112,7 @@ async function apiGet<T>(path: string, jwt: string): Promise<T> {
   const res = await fetch(path, {
     headers: { Authorization: `Bearer ${jwt}` },
   });
-  const data = await res.json();
+  const data = await readJson(res);
   if (!res.ok) {
     throw new Error(data.error || `HTTP ${res.status}`);
   }

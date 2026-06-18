@@ -12,8 +12,8 @@ export function BossSettingsPage() {
     fetchAgents();
   }, [fetchAgents]);
 
-  // Prefer the default agent id 'dudu', fall back to the main-role agent.
-  const boss = agents.find((a) => a.name === 'dudu') ?? agents.find((a) => a.role === 'main') ?? null;
+  // Prefer the default agent id 'boss', fall back to the main-role agent.
+  const boss = agents.find((a) => a.name === 'boss') ?? agents.find((a) => a.role === 'main') ?? null;
 
   return (
     <div className="space-y-6">
@@ -32,9 +32,7 @@ export function BossSettingsPage() {
       </div>
 
       {boss ? (
-        <div className="glass-card rounded-2xl p-6">
-          <AgentSettingsForm agent={boss} onSaved={fetchAgents} />
-        </div>
+        <AgentSettingsForm agent={boss} onSaved={fetchAgents} />
       ) : (
         <div className="glass-card rounded-2xl p-10 text-center text-stone-500 dark:text-stone-400">
           {loading ? '…' : intl.formatMessage({ id: 'agents.empty' })}
