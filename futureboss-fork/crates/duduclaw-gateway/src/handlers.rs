@@ -6758,10 +6758,16 @@ impl MethodHandler {
             };
             json!({
                 "provider_id": p.provider_id,
+                "name": match p.provider_id.as_str() {
+                    "google" => "Google",
+                    "github" => "GitHub",
+                    "slack" => "Slack",
+                    other => other,
+                },
                 "auth_url": p.auth_url,
                 "scopes": p.scopes,
                 "configured": !p.client_id.is_empty(),
-                "status": status,
+                "token_status": status,
                 "expires_at": token.and_then(|t| t.expires_at),
             })
         }).collect();
