@@ -17,7 +17,8 @@ function storedTheme(): Theme {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (raw === 'light' || raw === 'dark') return raw;
   } catch { /* storage unavailable */ }
-  return 'system';
+  // FutureBoss 預設淺色（dark 配色未整理，外觀切換鈕也已隱藏）。
+  return 'light';
 }
 
 /** Toggle the `.dark` class that drives the Tailwind dark variant. */

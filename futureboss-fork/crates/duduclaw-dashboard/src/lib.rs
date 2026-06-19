@@ -31,7 +31,22 @@ fn security_headers(builder: axum::http::response::Builder) -> axum::http::respo
         )
 }
 
-async fn index_handler() -> impl IntoResponse {
+async fn index_handler(uri: axum::http::Uri) -> Response {
+    // Serve root-level embedded assets (e.g. /dudu-cat.png, /favicon.ico) that
+    // live in dist/ but outside /assets/. Falls through to the SPA index.html
+    // for client-side routes (paths with no matching embedded file).
+    let raw = uri.path().trim_start_matches('/');
+    if !raw.is_empty() && raw != "index.html" {
+        if let Some(content) = Asset::get(raw) {
+            let mime = mime_guess::from_path(raw).first_or_octet_stream();
+            return security_headers(Response::builder())
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, mime.as_ref())
+                .header(header::CACHE_CONTROL, "public, max-age=86400")
+                .body(axum::body::Body::from(content.data.to_vec()))
+                .unwrap();
+        }
+    }
     match Asset::get("index.html") {
         Some(content) => {
             let html = std::str::from_utf8(content.data.as_ref())

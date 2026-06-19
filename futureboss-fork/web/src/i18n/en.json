@@ -1,6 +1,6 @@
 {
-  "app.name": "DuDuClaw",
-  "app.subtitle": "AI Assistant Console",
+  "app.name": "FutureBoss",
+  "app.subtitle": "Your personal AI twin",
   "nav.dashboard": "Dashboard",
   "nav.agents": "Agents",
   "nav.bossSettings": "Boss Settings",
@@ -647,7 +647,7 @@
   "odoo.webhookEnabled": "Enable Webhook push",
   "odoo.webhookSecret": "Webhook Secret",
   "odoo.webhookSecretHint": "Used to verify incoming Odoo webhook requests",
-  "nav.mcp": "MCP Tools",
+  "nav.mcp": "Integrations",
   "mcp.title": "MCP Server Management",
   "mcp.tab.agents": "Agent Config",
   "mcp.tab.marketplace": "Marketplace",

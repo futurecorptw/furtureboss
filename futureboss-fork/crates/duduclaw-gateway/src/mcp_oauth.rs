@@ -52,14 +52,24 @@ pub fn builtin_providers(redirect_uri: &str) -> Vec<McpOAuthConfig> {
     vec![
         McpOAuthConfig {
             provider_id: "google".into(),
-            client_id: String::new(),
-            client_secret: String::new(),
+            // Pre-configurable via env so forkers skip the Google Cloud setup:
+            // set GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET (e.g. in the
+            // launchd plist env or shell). When empty, falls back to manual entry
+            // in the dashboard "Configure OAuth Credentials" dialog.
+            client_id: std::env::var("GOOGLE_OAUTH_CLIENT_ID").unwrap_or_default(),
+            client_secret: std::env::var("GOOGLE_OAUTH_CLIENT_SECRET").unwrap_or_default(),
             auth_url: "https://accounts.google.com/o/oauth2/v2/auth".into(),
             token_url: "https://oauth2.googleapis.com/token".into(),
             scopes: vec![
                 "https://www.googleapis.com/auth/drive".into(),
-                "https://www.googleapis.com/auth/gmail.readonly".into(),
+                "https://mail.google.com/".into(),
                 "https://www.googleapis.com/auth/calendar".into(),
+                "https://www.googleapis.com/auth/documents".into(),
+                "https://www.googleapis.com/auth/spreadsheets".into(),
+                "https://www.googleapis.com/auth/presentations".into(),
+                "https://www.googleapis.com/auth/forms.body".into(),
+                "https://www.googleapis.com/auth/script.projects".into(),
+                "https://www.googleapis.com/auth/tasks".into(),
             ],
             redirect_uri: redirect_uri.to_string(),
         },

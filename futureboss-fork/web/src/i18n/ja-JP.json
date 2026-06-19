@@ -1,6 +1,6 @@
 {
-  "app.name": "DuDuClaw",
-  "app.subtitle": "AI アシスタントコンソール",
+  "app.name": "FutureBoss",
+  "app.subtitle": "あなた専属の AI 分身",
   "nav.dashboard": "ダッシュボード",
   "nav.agents": "Agent 管理",
   "nav.channels": "チャネル管理",
@@ -626,7 +626,7 @@
   "odoo.webhookEnabled": "Webhook プッシュを有効化",
   "odoo.webhookSecret": "Webhook シークレット",
   "odoo.webhookSecretHint": "Odoo からの Webhook リクエストの検証に使用",
-  "nav.mcp": "[EN] MCP Tools",
+  "nav.mcp": "連携サービス",
   "mcp.title": "[EN] MCP Server Management",
   "mcp.tab.agents": "[EN] Agent Config",
   "mcp.tab.marketplace": "[EN] Marketplace",

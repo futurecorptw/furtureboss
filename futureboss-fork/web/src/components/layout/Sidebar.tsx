@@ -91,7 +91,7 @@ export function Sidebar() {
         </span>
         <div>
           <h1 className="text-lg font-semibold tracking-tight text-stone-900 dark:text-stone-50">
-            DuDuClaw
+            FutureBoss
           </h1>
           <p className="text-xs text-stone-500 dark:text-stone-400">
             {intl.formatMessage({ id: 'app.subtitle' })}
