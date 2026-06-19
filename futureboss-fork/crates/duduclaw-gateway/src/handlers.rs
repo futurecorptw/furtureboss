@@ -6737,7 +6737,11 @@ impl MethodHandler {
     async fn handle_mcp_oauth_providers(&self) -> WsFrame {
         use crate::mcp_oauth;
 
-        let redirect_uri = format!("http://localhost:3000/api/mcp/oauth/callback");
+        // gateway 與 OAuth callback 路由同在 18789（Desktop client 走 loopback，
+        // Google 接受 http://localhost:<port>/<path>）。3000 是上游 dev 殘留，會導致
+        // Google 把 code 導到沒人接的埠 → 永遠「等待認證中」。
+        let redirect_uri = std::env::var("FUTUREBOSS_OAUTH_REDIRECT")
+            .unwrap_or_else(|_| "http://localhost:18789/api/mcp/oauth/callback".to_string());
         let providers = mcp_oauth::builtin_providers(&redirect_uri);
 
         let results: Vec<Value> = providers.iter().map(|p| {
@@ -6788,7 +6792,11 @@ impl MethodHandler {
         let client_secret = params.get("client_secret").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
         // Find the built-in provider or create a custom one
-        let redirect_uri = format!("http://localhost:3000/api/mcp/oauth/callback");
+        // gateway 與 OAuth callback 路由同在 18789（Desktop client 走 loopback，
+        // Google 接受 http://localhost:<port>/<path>）。3000 是上游 dev 殘留，會導致
+        // Google 把 code 導到沒人接的埠 → 永遠「等待認證中」。
+        let redirect_uri = std::env::var("FUTUREBOSS_OAUTH_REDIRECT")
+            .unwrap_or_else(|_| "http://localhost:18789/api/mcp/oauth/callback".to_string());
         let mut config = mcp_oauth::builtin_providers(&redirect_uri)
             .into_iter()
             .find(|p| p.provider_id == provider_id)
