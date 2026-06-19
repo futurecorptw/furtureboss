@@ -39,7 +39,8 @@ aside nav a[href="/marketplace"] { order: 7 !important; }  /* 應用市集 */
 aside nav a[href="/agents"]      { order: 8 !important; }  /* Agent 設定（已隱藏） */
 aside nav a[href="/boss"]        { order: 9 !important; }  /* Boss 設定 */
 aside nav a[href="/channels"]    { order: 10 !important; } /* 通道管理 */
-aside nav a[href="/settings"]    { order: 11 !important; } /* 系統設定 */
+aside nav a[href="/mcp"]         { order: 11 !important; } /* 整合服務（移到系統設定上方）*/
+aside nav a[href="/settings"]    { order: 12 !important; } /* 系統設定 */
 
 /* ---- 1. 主題變數覆寫（未分 layer，優先於 bundle 的 @layer/:root） ---- */
 :root {
