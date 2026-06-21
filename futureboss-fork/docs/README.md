@@ -1,6 +1,6 @@
 # DuDuClaw Documentation
 
-> Public documentation for the DuDuClaw Multi-Runtime AI Agent Platform (v1.9.4).
+> Public documentation for the DuDuClaw Multi-Runtime AI Agent Platform (v1.21.1).
 
 ---
 
@@ -30,6 +30,16 @@ Detailed introductions to DuDuClaw's standout features, with metaphors and flow 
 | [features/17-wiki-knowledge-layer.md](features/17-wiki-knowledge-layer.md) | Wiki knowledge layer — L0-L3 trust-weighted auto-injection |
 | [features/18-worktree-isolation.md](features/18-worktree-isolation.md) | Git worktree L0 isolation — lightweight per-task sandbox |
 | [features/19-agent-client-protocol.md](features/19-agent-client-protocol.md) | ACP/A2A protocol server — Zed / JetBrains / Neovim integration |
+| [features/20-memory-intelligence.md](features/20-memory-intelligence.md) | Memory intelligence — temporal facts + reflexion loop + batch fetch |
+| [features/21-governance-layer.md](features/21-governance-layer.md) | Governance layer — policy registry + per-agent quotas |
+| [features/22-durability-framework.md](features/22-durability-framework.md) | Durability — idempotency / retry / circuit breaker / checkpoint / DLQ |
+| [features/23-autopilot-engine.md](features/23-autopilot-engine.md) | Autopilot rule engine — event-driven automation + circuit breaker |
+| [features/24-task-board.md](features/24-task-board.md) | Task Board & Activity Feed — agent-as-teammate task management |
+| [features/25-identity-resolution.md](features/25-identity-resolution.md) | Identity resolution — WikiCache / Notion / Chained providers |
+| [features/26-mcp-http-sse.md](features/26-mcp-http-sse.md) | MCP HTTP/SSE transport — Bearer-authed REST + SSE |
+| [features/27-pty-pool-runtime.md](features/27-pty-pool-runtime.md) | Cross-platform PTY pool + worker — drive interactive claude REPL |
+| [features/28-live-forking.md](features/28-live-forking.md) | Live run forking — parallel branches + AI judge (duduclaw-fork) |
+| [features/29-evolution-events.md](features/29-evolution-events.md) | Evolution events — black-box recorder with batch+retry delivery |
 
 ---
 
@@ -47,16 +57,34 @@ Open standards that define the DuDuClaw agent ecosystem.
 
 | Document | Description | Status |
 |----------|-------------|--------|
-| [CLAUDE.md](CLAUDE.md) | Architecture overview (v1.9.4) | Current |
-| [evolution-engine.md](evolution-engine.md) | Evolution Engine v2 — Prediction + GVU² + Cognitive Memory | Current |
+| [architecture/overview.md](architecture/overview.md) | System architecture overview | Current |
+| [architecture/evolution-engine.md](architecture/evolution-engine.md) | Evolution Engine v2 — Prediction + GVU² + Cognitive Memory | Current |
+
+## Design Proposals (RFC / ADR)
+
+| Document | Description |
+|----------|-------------|
+| [rfc/RFC-21-identity-credential-isolation.md](rfc/RFC-21-identity-credential-isolation.md) | Identity resolution & per-agent credential isolation |
+| [rfc/RFC-21-operator-guide.md](rfc/RFC-21-operator-guide.md) | RFC-21 operator migration playbook |
+| [rfc/RFC-22-multi-agent-coordination-principles.md](rfc/RFC-22-multi-agent-coordination-principles.md) | Multi-agent coordination principles |
+| [rfc/RFC-26-deep-agents-alignment.md](rfc/RFC-26-deep-agents-alignment.md) | Deep-agents / live-forking alignment |
+| [adr/ADR-002-x-duduclaw-capability-negotiation.md](adr/ADR-002-x-duduclaw-capability-negotiation.md) | ACP capability negotiation decision |
+
+## Planning (TODO)
+
+| Document | Description |
+|----------|-------------|
+| [todo/TODO-agent-honesty.md](todo/TODO-agent-honesty.md) | Agent honesty / anti-hallucination tasks |
+| [todo/TODO-rfc26-live-forking.md](todo/TODO-rfc26-live-forking.md) | RFC-26 live-forking implementation tracking |
 
 ## User & Developer Guides
 
 | Document | Description | Status |
 |----------|-------------|--------|
-| [deployment-guide.md](deployment-guide.md) | Production deployment (Tailscale/ngrok/Docker/systemd) | Current |
-| [development-guide.md](development-guide.md) | Developer setup, agent development, browser automation | Current |
+| [guides/deployment-guide.md](guides/deployment-guide.md) | Production deployment (Tailscale/ngrok/Docker/systemd) | Current |
+| [guides/development-guide.md](guides/development-guide.md) | Developer setup, agent development, browser automation | Current |
 | [guides/custom-mcp-tool.md](guides/custom-mcp-tool.md) | Extending MCP tools — step-by-step guide | Current |
+| [guides/docker.md](guides/docker.md) | Docker build & run | Current |
 
 ## API Reference
 
@@ -70,91 +98,37 @@ Open standards that define the DuDuClaw agent ecosystem.
 ## Directory Structure
 
 ```
-docs/
+docs/                                  # L1 PUBLIC — product & developer documentation
 ├── README.md                          # This index
-├── features/                          # Feature highlight articles
-│   ├── README.md                      #   Feature index
-│   ├── feature-inventory.md           #   Complete feature inventory
-│   ├── 01-prediction-driven-evolution.md
-│   ├── 02-gvu-self-play-loop.md
-│   ├── 03-confidence-router.md
-│   ├── 04-file-based-ipc.md
-│   ├── 05-security-defense.md
-│   ├── 06-soul-versioning.md
-│   ├── 07-account-rotation.md
-│   ├── 08-browser-automation.md
-│   ├── 09-behavioral-contracts.md
-│   ├── 10-cognitive-memory.md
-│   ├── 11-token-compression.md
-│   ├── 12-industry-templates.md
-│   ├── 13-multi-runtime.md
-│   ├── 14-voice-pipeline.md
-│   ├── 15-skill-lifecycle.md
-│   ├── 16-session-memory-stack.md
-│   ├── 17-wiki-knowledge-layer.md
-│   ├── 18-worktree-isolation.md
-│   └── 19-agent-client-protocol.md
+├── architecture/                      # System architecture & engine design
+│   ├── overview.md                    #   Architecture overview
+│   └── evolution-engine.md            #   Evolution Engine v2 spec
+├── rfc/                               # Request-for-Comments design proposals
+│   ├── RFC-21-identity-credential-isolation.md
+│   ├── RFC-21-operator-guide.md
+│   ├── RFC-22-multi-agent-coordination-principles.md
+│   └── RFC-26-deep-agents-alignment.md
+├── adr/                               # Architecture Decision Records
+│   └── ADR-002-x-duduclaw-capability-negotiation.md
+├── todo/                              # Public planning / tracking docs
+│   ├── TODO-agent-honesty.md
+│   └── TODO-rfc26-live-forking.md
+├── features/                          # Feature highlight articles (+ ja-JP, zh-TW)
+│   ├── README.md
+│   ├── feature-inventory.md
+│   └── 01-…-19-…                      #   19 feature deep-dives
 ├── spec/                              # Open format specifications
 │   ├── soul-md-spec.md                #   SOUL.md format v1.0
 │   ├── contract-toml-spec.md          #   CONTRACT.toml format v1.0
 │   └── contract-toml-schema.json
-├── api/
-│   ├── README.md                      # WebSocket RPC protocol
-│   └── openapi.yaml                   # OpenAPI spec
-├── guides/
-│   └── custom-mcp-tool.md             # MCP tool development guide
-│
-├── # Architecture
-├── CLAUDE.md                          # System architecture overview
-├── evolution-engine.md                # Evolution Engine v2 spec
-├── odoo-integration-plan.md           # Odoo ERP bridge design
-├── feasibility-kubernetes.md          # K8s feasibility study
-│
-├── # Guides
-├── deployment-guide.md                # Production deployment
-├── development-guide.md               # Developer setup
-├── account-rotation-guide.md          # Multi-account rotation
-│
-├── # Business
-├── business-plan.md                   # Commercial plan v2.0
-├── TODO-commercialization.md          # Commercialization tasks
-├── content-policy.md                  # Content tiering rules
-├── security-patch-sop.md              # Patch release SOP
-├── implementation-methodology/        # 5-phase SI delivery
-│   ├── 01-discovery.md
-│   ├── 02-poc.md
-│   ├── 03-build.md
-│   ├── 04-pilot.md
-│   ├── 05-handover.md
-│   └── templates/quotation-template.md
-│
-├── # Competitive
-├── duduclaw-vs-openclaw.md            # Feature comparison
-├── gap-analysis-vs-openclaw.md        # Gap tracker
-├── claw-ecosystem-report.md           # Ecosystem survey
-│
-├── # Active TODOs
-├── TODO-roadmap-v0.10-v0.12.md        # Master roadmap (97%)
-├── TODO-browser-automation.md
-├── TODO-evolution-engine-v2.md
-├── TODO-local-inference.md
-├── TODO-model-registry.md
-├── TODO-token-cost-defense.md
-├── TODO-cli-streaming-keepalive.md
-│
-└── archive/                           # Completed work
-    ├── TODO-memory-collaboration.md
-    ├── TODO-security-hooks.md
-    ├── TODO-skill-lifecycle.md
-    ├── TODO-dashboard-settings.md
-    └── reviews/
-        ├── CODE-REVIEW-R1.md
-        ├── REVIEW-memory-collaboration.md
-        ├── code-review-fixes-evolution-v2.md
-        ├── code-review-local-inference.md
-        ├── code-review-model-registry.md
-        ├── code-review-security-hooks.md
-        └── code-review-v0.6.0.md
+├── guides/                            # User & developer guides
+│   ├── deployment-guide.md
+│   ├── development-guide.md
+│   ├── custom-mcp-tool.md
+│   └── docker.md
+└── api/
+    ├── README.md                      # WebSocket RPC protocol
+    └── openapi.yaml                   # OpenAPI spec
 ```
 
-> Implementation TODOs, business plans, competitive analysis, and research documents are maintained in the private `commercial/` repository.
+> **Confidentiality tiers** — `docs/` is **Public**. Internal operational reports (daily/sprint/eval) live under `wiki/` and `reports`-style trees; commercial plans, competitive analysis, and research notes are **Confidential** and kept in the gitignored `commercial/` and `research/` trees. See the project root `CLAUDE.md` → "Documentation Classification & Placement" for the full rule.

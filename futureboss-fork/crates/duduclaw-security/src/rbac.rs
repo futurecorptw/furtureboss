@@ -174,6 +174,7 @@ mod tests {
                 api_mode: "cli".to_string(),
                 utility: "claude-haiku-4-5".to_string(),
             },
+            prompt: Default::default(),
             container: ContainerConfig {
                 timeout_ms: 30000,
                 max_concurrent: 1,
@@ -185,6 +186,8 @@ mod tests {
                 worktree_auto_merge: true,
                 worktree_cleanup_on_exit: true,
                 worktree_copy_files: vec![],
+                cmd: vec![],
+                env: vec![],
             },
             heartbeat: HeartbeatConfig {
                 enabled: false,

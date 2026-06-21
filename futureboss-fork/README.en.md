@@ -30,9 +30,69 @@ observability. Same architecture standards as DuDuClaw.
 [![Rust](https://img.shields.io/badge/Rust-2024_edition-orange?logo=rust)](https://www.rust-lang.org/)
 [![Python](https://img.shields.io/badge/Python-3.9+-blue?logo=python)](https://www.python.org/)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.20.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
+[![Version](https://img.shields.io/badge/version-1.22.1-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
 [![npm](https://img.shields.io/npm/v/duduclaw?logo=npm)](https://www.npmjs.com/package/duduclaw)
 [![PyPI](https://img.shields.io/pypi/v/duduclaw?logo=pypi)](https://pypi.org/project/duduclaw/)
+
+---
+
+## 🔒 Trust & Security
+
+This is an open-source project — here's full transparency on what you're installing.
+
+### Why is a "new" npm package already at version 1.21+?
+
+DuDuClaw had several months of intensive development in a private repository (400+ commits) before
+going public. See the [git log](https://github.com/zhixuli0406/DuDuClaw/commits/main) for full history.
+
+### What's inside the npm package?
+
+- A small JS wrapper that only invokes the platform-specific Rust binary
+- The platform binary ships via npm `optionalDependencies` (`@duduclaw/<platform>`) —
+  **no postinstall script downloads and executes external code from arbitrary URLs**
+- `postinstall` only checks that the platform package is present (see
+  [`npm/duduclaw/scripts/install.js`](npm/duduclaw/scripts/install.js)) — it downloads and executes nothing
+- GitHub Release binaries ship with SHA-256 checksums
+
+### Building from source (if you don't trust the prebuilt binary)
+
+```bash
+git clone https://github.com/zhixuli0406/DuDuClaw
+cd DuDuClaw
+cargo build --release
+```
+
+### Binary verification
+
+Every release ships with SHA-256 checksums and a keyless [cosign](https://github.com/sigstore/cosign) signature:
+
+```bash
+# Download from Releases
+wget https://github.com/zhixuli0406/DuDuClaw/releases/download/v1.21.1/duduclaw-darwin-arm64.tar.gz
+
+# Verify SHA-256 (against the .sha256 file in the release)
+shasum -a 256 -c duduclaw-darwin-arm64.tar.gz.sha256
+
+# Verify the cosign signature
+cosign verify-blob \
+  --certificate duduclaw-darwin-arm64.tar.gz.pem \
+  --signature duduclaw-darwin-arm64.tar.gz.sig \
+  --certificate-identity-regexp "https://github.com/zhixuli0406/DuDuClaw" \
+  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+  duduclaw-darwin-arm64.tar.gz
+```
+
+### Supply chain transparency
+
+- **License**: Apache 2.0
+- **Maintainer**: 嘟嘟數位科技有限公司 (Taiwan-registered company, 統編 94139082)
+- **Public commit history**: github.com/zhixuli0406/DuDuClaw
+- **CI/CD**: All releases are built via GitHub Actions
+- **No telemetry**: zero phone-home calls
+- **No API key collection**: all secrets stay on your machine via an AES-256-GCM vault
+- **No privileged escalation**: runs entirely in user space
+
+To report a vulnerability, see [SECURITY.md](SECURITY.md).
 
 ---
 
@@ -57,18 +117,23 @@ infrastructure work.
 
 ---
 
-> 🎉 **v1.18.0 — Dashboard budget/usage correctness + reliability fixes** ([Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.18.0))
+> 🎉 **v1.22.0 — RFC-26 Live Forking ships · Skill-synthesis scheduler · Calm Glass dashboard** ([Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.22.0))
 >
-> The Dashboard's budget and usage now read from the persistent `CostTelemetry` ledger instead of the in-memory counter that reset to zero on every rebuild, plus a round of dashboard runtime bug cleanup.
+> Three headlines: **RFC-26 Live Forking** completes rounds 1–4 — split an in-flight task into N competing branches that explore different strategies in copy-on-write isolated workspaces and let an AI judge pick the winner; the **Skill-synthesis scheduler** (W19-P1) makes "conversation → skill" extraction run autonomously on an interval; and the **Calm Glass dashboard** rebuilds every page on a shared component library. All three are off by default and opt-in.
 >
-> - **Budget/usage shows real numbers** — Previously every budget display read `AccountRotator.spent_this_month`, but this in-memory counter reset to zero every 5 minutes when the rotator was rebuilt, reset to zero on gateway restart, cost 0 per call for OAuth subscription accounts anyway, and showed the same "sum across all accounts" number for every agent. It now reads month-to-date usage from `CostTelemetry` (a persistent SQLite ledger): `agents.list` / `agents.inspect` show **each agent's own** monthly usage, and `accounts.budget_summary` shows the real global total
-> - **Cost unit fix** — The `cost_millicents` field name was a misnomer; what's actually stored is integer cents (verified by back-calculating from pricing: one record of 309 = $3.09). Removed the redundant `/10` in the analytics cost/savings display (which previously under-reported by 10x)
-> - **`marketplace.install` properly implemented** — Previously a stub that returned an error; it now installs the catalog MCP server into the specified agent's `.mcp.json`, with a target-agent selection dialog added to the frontend
-> - **Settings persistence gaps filled** — `system.version` returns `edition` so the dashboard can determine Pro-only UI; `system.update_config` writes `[voice]` into `inference.toml`, and per-agent `[proactive]` is saved into `agent.toml` via `agents.update` and backfilled by `agents.inspect`
-> - **Frontend fixes** — Scheduling now sends the required `name`+`task` on submit (previously failed), MCP servers are consumed in the backend-serialized array shape, added a theme store + wired language switching into the Header, added 88 i18n keys across `zh-TW` / `en` / `ja-JP`, budget progress bar division-by-zero guard, and account silent errors now surface as toasts
+> - **Live Forking** — `duduclaw-fork` engine + 6 MCP tools + cross-process SQLite `ForkStore` + `RotatingBranchExecutor` (a distinct account per branch) + `LiveAggregate` cross-branch budget pre-emption (kills the priciest in-flight branch) + native copy-on-write overlay (`clonefile` / `--reflink`). Default off; enable per agent via `agent.toml [fork] enabled = true`
+> - **Skill-synthesis scheduler** — `config.toml [skill_synthesis] auto_run/dry_run/interval_hours/lookback_days` + dashboard `skill_synthesis.get/update` RPCs; `skill_synthesis_threshold` is back to a `u32` count (fixes the registry scan rejecting `0.7`)
+> - **Calm Glass** — shared `web/src/components/ui/` library + `nav-model.ts` 6-group sidebar + `web/DESIGN.md` spec, with synchronized en/ja/zh i18n
+> - **Docs** — 10 new feature deep-dives (20–29) × en/ja/zh, back-translated 16–19, `feature-inventory` refreshed to v1.22.0
 
 <details>
-<summary><strong>v1.9.4 → v1.17.x cumulative highlights</strong></summary>
+<summary><strong>v1.9.4 → v1.20.x cumulative highlights</strong></summary>
+
+- **v1.21.0** — RFC-25 §5 followups: the non-Claude (Codex / Gemini / OpenAI-compat) path closes all 11 gaps to become first-class (multi-turn context, cost telemetry, keepalive, per-(home,provider) failover backoff); `release.sh` multi-platform version sync + drift audit + post-bump assertion + `verify`, fixing the `skip-existing` silent PyPI freeze
+- **v1.20.0** — RFC-25 Multi-Runtime Unlock + A2A: the "Multi-Runtime four-backend" abstraction was previously orphan, uncompiled source — every execution path hardcoded Claude. v1.20.0 wires it up and routes the LLM-calling subsystems through a single provider-agnostic choke-point (`runtime_dispatch::run_agent_prompt` + a lazily auto-detecting `RuntimeRegistry`); channel reply / GVU / sub-agent delegation route through the choke-point for non-Claude providers (Claude keeps its OAuth-rotation / PTY path, zero regression); ACP `tasks/send` actually runs the target agent and reports Failed / Completed; Phase 0 removed the GVU evolution-model hard-lock (reject → warn)
+
+- **v1.19.0** — Memory Intelligence: the W18/W19-designed memory layer, implemented non-invasively on the live Rust `SqliteMemoryEngine`. **Temporal Memory** (`memories` gains temporal / knowledge-graph columns + `store_temporal` automatic supersession chain + `get_history`/`get_at`; search default-filters to currently-valid memories); **Reflexion Loop** (bridges the existing `MistakeNotebook`: recall injected into the answering prompt + ≥3 same-category mistakes consolidated into a semantic rule); **`memory_fetch_batch`** MCP tool (fetch ≤100 entries by ID, namespace/ownership enforced). `MemoryEntry` unchanged, zero blast radius
+- **v1.18.0** — Dashboard budget/usage correctness: reads from the persistent `CostTelemetry` ledger (replacing the in-memory counter that reset to zero on rebuild), fixes the `cost_millicents` unit misnomer, implements `marketplace.install`, fills settings-persistence gaps, plus a round of frontend runtime-bug cleanup + 88 i18n keys
 
 - **v1.17.0** — RFC-24 License v2.0 (Open Core foundation): new crate `duduclaw-license` (verification-only client, signing keys stay in `commercial/duduclaw-license`), a 7-tier inheritance chain `OpenSource` / `Hobby` / `Solo` / `Studio` / `Business` / `SelfHostPro` / `Oem`, an Ed25519 trust registry seeded from `DUDUCLAW_LICENSE_PUBKEY_<ID>` env (empty registry fail-safe falls back to OpenSource). The Apache 2.0 core is **available without restriction**; paid subscriptions unlock the `commercial/*` value-add modules
 - **v1.16.0** — MCP Refresh Tokens + GVU `SoulPatchOp::Consolidate`: new module `mcp_refresh` provides long-lived credentials backed by `~/.duduclaw/mcp_tokens.db` (`ddc_refresh_<env>_<64hex>`, 90 days, revocable, hash-only storage), solving the silent disconnect-without-retry after Claude Desktop auth-fail; GVU adds a `SoulPatchOp::Consolidate` variant carrying a "shrink invariant" so SOUL.md can self-trigger consolidation as it approaches the 150-line / 8KB hard cap
@@ -396,13 +461,16 @@ Degradation: automatically drops one level after 24 hours with no events (RED→
 
 ## Installation
 
-### npm (recommended)
+### npm (recommended, all platforms incl. Windows)
 
 ```bash
 npm install -g duduclaw
 ```
 
-After installation it automatically downloads the precompiled binary for your platform (supports macOS ARM64/x64, Linux x64/ARM64, Windows x64).
+After installation it automatically downloads the **precompiled binary** for your platform (supports macOS ARM64/x64, Linux x64/ARM64, Windows x64) — **no compiler, no Rust, no MSVC Build Tools required**. Windows users only need [Node.js](https://nodejs.org/) installed first; that is the only prerequisite.
+
+> **⚠️ If installation asks you to install Rust / MSVC Build Tools (~2GB) and compile (~1.5h), you're on the wrong path.**
+> That's the "[Build from source](#build-from-source)" path, only needed by contributors who modify the code. For normal use, always use `npm install -g duduclaw` above (or Homebrew / one-line install below) — it downloads the official prebuilt binary directly.
 
 ### Homebrew (macOS / Linux)
 
@@ -412,24 +480,67 @@ brew install zhixuli0406/tap/duduclaw
 
 ### One-line install
 
+**macOS / Linux:**
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/zhixuli0406/DuDuClaw/main/scripts/install.sh | sh
 ```
 
-### Python SDK (required dependency)
+**Windows (PowerShell):**
 
-DuDuClaw's evolution engine (Skill Vetter) and some channel bridges require a Python environment:
+```powershell
+irm https://raw.githubusercontent.com/zhixuli0406/DuDuClaw/main/scripts/install.ps1 | iex
+```
+
+> The one-line installer auto-detects the **latest release** and downloads the prebuilt binary for your platform — also compile-free. It only offers a source build if the GitHub download fails (in which case prefer `npm install -g duduclaw`). Pin a specific version with the `DUDUCLAW_VERSION` environment variable.
+
+### Python SDK (optional library, not a CLI)
+
+> **Important**: The core gateway / CLI (the `duduclaw` command) is a **Rust binary** — installing it via **npm** or **Homebrew** above gives you the **complete feature set**. Skill security scanning and channel replies are all handled by Rust-native paths, so **no Python dependency is required**.
+> The `duduclaw` package on PyPI is a **pure Python library** (for `import duduclaw`) and ships **no command-line tool**; consequently `pipx install duduclaw` fails (No apps associated with package) — this is expected.
+
+`pip install duduclaw` is **optional for core functionality** — only needed when:
+
+- You want to `import duduclaw` in your own Python code (the agents / channels / mcp / memory_eval modules).
+- You run the standalone memory-evaluation tooling (LOCOMO).
+
+> **Advanced local inference (MLX reflections / LLMLingua-2 compression)** is a separate opt-in feature set that depends on ML packages such as `mlx_lm` and `llmlingua` — **not** on the `duduclaw` PyPI package. Install those individually per `inference.toml` when needed.
+
+To install the optional library:
 
 ```bash
 pip install duduclaw
 ```
 
-This command installs the following required dependencies:
+This command installs the following dependencies:
 
 | Package | Minimum version | Purpose |
 |------|---------|------|
-| `anthropic` | ≥ 0.40 | Direct Claude API calls, Skill security scan |
+| `anthropic` | ≥ 0.40 | Direct Claude API calls from your own Python code |
 | `httpx` | ≥ 0.27 | Async HTTP client (account rotation, health checks) |
+| `pyyaml` | ≥ 6.0 | Config file parsing |
+
+#### macOS (Homebrew Python) / other externally-managed environments
+
+If the system reports `error: externally-managed-environment` ([PEP 668](https://peps.python.org/pep-0668/)), installing into the system Python is blocked. Use a virtual environment instead:
+
+```bash
+# venv
+python3 -m venv .venv && source .venv/bin/activate
+pip install --upgrade duduclaw
+
+# or use uv (already adopted by this project, much faster)
+uv venv && uv pip install --upgrade duduclaw
+```
+
+Verify the installed version:
+
+```python
+import duduclaw
+print(duduclaw.__version__)   # reflects the actually installed PyPI version
+```
+
+> `__version__` is read dynamically from the installed package metadata (`pyproject.toml`) via `importlib.metadata`; a source checkout (not pip-installed) falls back to a built-in string, kept in sync with the other platform versions by `scripts/release.sh`'s drift guard.
 
 For development environments, additionally install:
 
@@ -444,8 +555,8 @@ pip install duduclaw[dev]
 git clone https://github.com/zhixuli0406/DuDuClaw.git
 cd DuDuClaw
 
-# Install Python dependencies
-pip install duduclaw
+# (Optional) only needed for the importable Python library / memory-eval tooling; the core build does not require it
+# pip install duduclaw
 
 # Build the Dashboard
 cd web && npm ci --legacy-peer-deps && npm run build && cd ..
@@ -638,9 +749,9 @@ cd web && npx tsc --noEmit
 - [docs/spec/soul-md-spec.md](docs/spec/soul-md-spec.md) — SOUL.md format spec v1.0
 - [docs/spec/contract-toml-spec.md](docs/spec/contract-toml-spec.md) — CONTRACT.toml format spec v1.0
 - [docs/api/README.md](docs/api/README.md) — WebSocket RPC protocol + JSON-RPC 2.0 interface
-- [docs/evolution-engine.md](docs/evolution-engine.md) — Evolution Engine v2 design document
-- [docs/deployment-guide.md](docs/deployment-guide.md) — Production deployment guide
-- [docs/development-guide.md](docs/development-guide.md) — Developer setup and Agent development
+- [docs/architecture/evolution-engine.md](docs/architecture/evolution-engine.md) — Evolution Engine v2 design document
+- [docs/guides/deployment-guide.md](docs/guides/deployment-guide.md) — Production deployment guide
+- [docs/guides/development-guide.md](docs/guides/development-guide.md) — Developer setup and Agent development
 - [docs/guides/custom-mcp-tool.md](docs/guides/custom-mcp-tool.md) — Custom MCP tool tutorial
 
 ---

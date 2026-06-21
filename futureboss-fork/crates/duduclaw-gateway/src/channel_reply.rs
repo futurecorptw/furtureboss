@@ -39,11 +39,11 @@ pub type ChannelStatusMap = Arc<RwLock<std::collections::HashMap<String, Channel
 // ── Multi-turn conversation types ──────────────────────────
 
 /// A single turn in conversation history, used for native multi-turn support.
-#[derive(Debug, Clone)]
-pub struct ConversationTurn {
-    pub role: String,    // "user" | "assistant"
-    pub content: String,
-}
+///
+/// Re-exported from [`crate::runtime`] so the channel-reply path and the runtime
+/// trait path share one type instead of two structurally-identical copies
+/// (RFC-25 A1).
+pub use crate::runtime::ConversationTurn;
 
 /// Maximum character count for a single turn before it gets trimmed.
 /// Inspired by Hermes Agent's tool output trimming (Phase 1 compression).
@@ -588,7 +588,23 @@ async fn build_reply_with_session_inner(
             // Fallback: config.toml default_agent → main_agent()
             let default_agent_name = get_default_agent(&ctx.home_dir).await;
             if let Some(name) = &default_agent_name {
-                reg.get(name).or_else(|| reg.main_agent())
+                match reg.get(name) {
+                    Some(a) => Some(a),
+                    None => {
+                        // A dangling `default_agent` (renamed/removed agent) is
+                        // the classic cause of "identity mixing": routing
+                        // silently falls back to an arbitrary main agent, so the
+                        // wrong agent answers. Warn loudly per turn so it's
+                        // visible in logs until config.toml is fixed.
+                        warn!(
+                            "default_agent '{name}' is not a loaded agent — \
+                             routing fell back to the main agent; replies may \
+                             come from the wrong agent. Fix `default_agent` in \
+                             config.toml or remove it."
+                        );
+                        reg.main_agent()
+                    }
+                }
             } else {
                 reg.main_agent()
             }
@@ -612,6 +628,21 @@ async fn build_reply_with_session_inner(
     let external_factors_config = agent
         .map(|a| a.config.evolution.external_factors.clone())
         .unwrap_or_default();
+
+    // Cognitive memory layer toggle (agent.toml [evolution] cognitive_memory).
+    // When disabled, every SqliteMemoryEngine path below is skipped: key-fact
+    // recall into the system prompt, key-fact extraction/storage, and the
+    // Reflexion → semantic-memory consolidation. Gating once here (rather than
+    // at each call site) keeps a single source of truth. Falls back to the
+    // EvolutionConfig default (true) when no agent resolved.
+    let cognitive_memory_db = if agent
+        .map(|a| a.config.evolution.cognitive_memory)
+        .unwrap_or(true)
+    {
+        ctx.memory_db_path.clone()
+    } else {
+        None
+    };
 
     // Refresh compressed skill cache from agent's loaded skills
     {
@@ -1025,7 +1056,7 @@ async fn build_reply_with_session_inner(
         // P2 Key-Fact Accumulator: inject cross-session facts (middle position —
         // stable reference data that doesn't need U-shaped peak attention).
         // Uses spawn_blocking because SqliteMemoryEngine is !Send (rusqlite).
-        if let Some(db_path) = ctx.memory_db_path.clone() {
+        if let Some(db_path) = cognitive_memory_db.clone() {
             let aid = agent_id.clone();
             let query = sanitized_text.clone();
             if let Ok(facts_text) = tokio::task::spawn_blocking(move || {
@@ -1288,34 +1319,78 @@ async fn build_reply_with_session_inner(
         );
     }
 
-    // RFC-25 Phase 1: provider-agnostic routing. When the agent's
-    // `[runtime] provider` is not Claude, route the whole reply through the
-    // multi-runtime choke-point (Codex / Gemini / OpenAI-compat). Claude keeps
-    // its optimized OAuth-rotation + PTY path below (unchanged, zero regression).
-    let runtime_provider = agent_dir
+    // RFC-25 Phase 1 (L8): provider-agnostic routing via the centralized
+    // decision predicate. When the agent's `[runtime] provider` is not Claude,
+    // route the whole reply through the multi-runtime choke-point (Codex /
+    // Gemini / OpenAI-compat). Claude keeps its optimized OAuth-rotation + PTY
+    // path below (unchanged, zero regression).
+    // Parse agent.toml once (L7 followup): the routing decision and the
+    // choke-point both need it, so load here and thread the settings through
+    // `AgentPrompt.runtime_settings` instead of re-reading inside the choke-point.
+    let runtime_settings = agent_dir
         .as_deref()
-        .map(crate::runtime_config::agent_runtime_provider)
-        .unwrap_or_default();
+        .map(crate::runtime_config::load_runtime_settings);
+    let non_claude = runtime_settings
+        .as_ref()
+        .and_then(|s| s.non_claude_provider());
 
     let cli_future: std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<String, String>> + Send + '_>,
-    > = if runtime_provider != duduclaw_core::types::RuntimeType::Claude {
+    > = if let Some(provider) = non_claude {
         info!(
             agent_id = %agent_id,
-            provider = runtime_provider.as_str(),
+            provider = provider.as_str(),
             "channel_reply: routing through multi-runtime choke-point (non-Claude provider)"
         );
-        Box::pin(crate::runtime_dispatch::run_agent_prompt_text(
-            crate::runtime_dispatch::AgentPrompt {
-                agent_dir: agent_dir.as_deref(),
-                home_dir: &ctx.home_dir,
-                agent_id: &agent_id,
-                prompt: &effective_message,
-                system_prompt: &full_system_prompt,
-                model: &model,
-                max_tokens: 8192,
-            },
-        ))
+        // RFC-25 A4: non-Claude runtimes don't stream incremental progress, so
+        // emit a periodic Keepalive while the (potentially long) call is in flight
+        // — same typing/"still working" indicator the Claude stream-json path
+        // drives — so the channel doesn't look stalled or hit an idle timeout.
+        // Bind plain references first so the `async move` captures only Copy
+        // references (not the owners, which the Claude `else` arm still borrows).
+        let hb_progress = on_progress.as_ref();
+        let hb_agent_dir = agent_dir.as_deref();
+        let hb_home = ctx.home_dir.as_path();
+        let hb_agent_id = agent_id.as_str();
+        let hb_prompt = effective_message.as_str();
+        let hb_system = full_system_prompt.as_str();
+        let hb_model = model.as_str();
+        let hb_history = conversation_history.as_slice();
+        let hb_settings = runtime_settings.as_ref();
+        Box::pin(async move {
+            let work = crate::runtime_dispatch::run_agent_prompt_text(
+                crate::runtime_dispatch::AgentPrompt {
+                    agent_dir: hb_agent_dir,
+                    home_dir: hb_home,
+                    agent_id: hb_agent_id,
+                    prompt: hb_prompt,
+                    system_prompt: hb_system,
+                    model: hb_model,
+                    max_tokens: 8192,
+                    provider_override: None,
+                    // RFC-25 A1: thread the real session history so non-Claude
+                    // (Codex/Gemini/OpenAI) agents keep multi-turn context.
+                    conversation_history: hb_history,
+                    request_type: crate::cost_telemetry::RequestType::Chat,
+                    // L7 followup: reuse the settings parsed above (1 read/reply).
+                    runtime_settings: hb_settings,
+                },
+            );
+            tokio::pin!(work);
+            let mut ticker =
+                tokio::time::interval(std::time::Duration::from_secs(KEEPALIVE_INTERVAL_SECS));
+            ticker.tick().await; // consume the immediate first tick
+            loop {
+                tokio::select! {
+                    res = &mut work => break res,
+                    _ = ticker.tick() => {
+                        if let Some(cb) = hb_progress {
+                            cb(ProgressEvent::Keepalive);
+                        }
+                    }
+                }
+            }
+        })
     } else {
         match runtime_mode {
             crate::pty_runtime::RuntimeMode::PtyPool => Box::pin(call_claude_cli_pty_rotated(
@@ -1417,31 +1492,30 @@ async fn build_reply_with_session_inner(
         }
     };
 
-    // 3. Fallback: Python wrapper (with account rotator)
+    // 3. Fallback: Direct Anthropic Messages API (Rust-native, no Python).
     //
-    // The Python SDK uses the `anthropic` package (Direct API) which requires
-    // an API key — OAuth tokens are not supported. Only attempt this fallback
-    // when an API key is available; skip entirely for OAuth-only setups to
-    // avoid the misleading "未設定任何 API 帳號" error message.
+    // The Direct API requires an API key — OAuth tokens are not supported.
+    // Only attempt this fallback when an API key is available; skip entirely
+    // for OAuth-only setups to avoid the misleading "未設定任何 API 帳號" error.
     let fallback_api_key = get_api_key(&ctx.home_dir).await;
     let reply = match reply {
         Some(r) => Some(r),
         None if fallback_api_key.is_some() => {
-            match call_python_sdk_v2(
-                &sanitized_text, &model, &full_system_prompt, &ctx.home_dir,
-                fallback_api_key.as_deref(),
+            let key = fallback_api_key.as_deref().unwrap_or_default();
+            match crate::direct_api::call_direct_api(
+                key, &model, &full_system_prompt, &sanitized_text, &[],
             ).await {
-                Ok(reply) => {
-                    info!("Claude replied via Python SDK ({} chars)", reply.len());
-                    Some(reply)
+                Ok(resp) => {
+                    info!("Claude replied via Direct API ({} chars)", resp.text.len());
+                    Some(resp.text)
                 }
                 Err(e) => {
-                    let log_line = format!("[{}] python SDK error: {e}\n", chrono::Utc::now());
+                    let log_line = format!("[{}] direct API error: {e}\n", chrono::Utc::now());
                     let _ = tokio::fs::OpenOptions::new()
                         .create(true).append(true)
                         .open(ctx.home_dir.join("debug.log")).await
                         .map(|mut f| { use tokio::io::AsyncWriteExt; tokio::spawn(async move { let _ = f.write_all(log_line.as_bytes()).await; }); });
-                    warn!("Python SDK unavailable: {e}");
+                    warn!("Direct API unavailable: {e}");
                     // Only overwrite if we don't already have a more specific CLI error.
                     if last_cli_error.is_none() {
                         last_cli_error = Some(e);
@@ -1451,7 +1525,7 @@ async fn build_reply_with_session_inner(
             }
         }
         None => {
-            info!("Skipping Python SDK fallback — no API key available (OAuth-only setup)");
+            info!("Skipping Direct API fallback — no API key available (OAuth-only setup)");
             None
         }
     };
@@ -1616,7 +1690,7 @@ async fn build_reply_with_session_inner(
         // Only extracts when reply is long enough to contain useful information.
         // Async, non-blocking — same pattern as instruction extraction.
         if reply.len() > 100 {
-            if let Some(db_path) = ctx.memory_db_path.clone() {
+            if let Some(db_path) = cognitive_memory_db.clone() {
                 let agent_id_for_facts = agent_id.clone();
                 let user_text_for_facts = sanitized_text.clone();
                 let reply_snippet = duduclaw_core::truncate_bytes(&reply, 500).to_string();
@@ -1703,7 +1777,7 @@ async fn build_reply_with_session_inner(
             let gap_acc_for_pred = ctx.gap_accumulator.clone();
             let sandbox_for_pred = ctx.sandbox_store.clone();
             let notebook_for_pred = ctx.mistake_notebook.clone();
-            let memory_db_path_for_pred = ctx.memory_db_path.clone();
+            let memory_db_path_for_pred = cognitive_memory_db.clone();
             let ext_factors_cfg = external_factors_config.clone();
             let evolution_emitter_for_pred = ctx.evolution_emitter.clone();
 
@@ -2208,6 +2282,10 @@ async fn build_reply_with_session_inner(
                                             system_prompt: "",
                                             model: &model,
                                             max_tokens: 4096,
+                                            provider_override: None,
+                                            conversation_history: &[],
+                                            request_type: crate::cost_telemetry::RequestType::Evolution,
+                                            runtime_settings: None,
                                         },
                                     )
                                     .await
@@ -2532,7 +2610,7 @@ pub(crate) enum FailureReason {
     Unknown,
 }
 
-/// Classify an error string produced by `call_claude_cli_rotated` or `call_python_sdk_v2`.
+/// Classify an error string produced by `call_claude_cli_rotated` or the Direct API fallback.
 pub(crate) fn classify_cli_failure(err: &str) -> FailureReason {
     let lower = err.to_lowercase();
 
@@ -2733,6 +2811,45 @@ mod multi_turn_tests {
             format!("<task_recap>\n{pinned}\n</task_recap>\n\n{msg}")
         };
         assert_eq!(effective, "hello");
+    }
+}
+
+#[cfg(test)]
+mod token_owner_tests {
+    use super::*;
+
+    fn agents(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs.iter().map(|(n, t)| (n.to_string(), t.to_string())).collect()
+    }
+
+    fn lookup<'a>(global: &str, agents: &'a [(String, String)]) -> Option<&'a str> {
+        find_global_token_owner(global, agents.iter().map(|(n, t)| (n.as_str(), t.as_str())))
+    }
+
+    #[test]
+    fn global_token_shared_with_agent_returns_owner() {
+        // The customer's CEO scenario: same token in config.toml and agent.ceo.
+        let agents = agents(&[("ceo", "TOK_CEO"), ("coo", "TOK_COO")]);
+        assert_eq!(lookup("TOK_CEO", &agents), Some("ceo"));
+    }
+
+    #[test]
+    fn global_only_token_has_no_owner() {
+        // COO-style: token lives only globally → global poller must run.
+        let agents = agents(&[("ceo", "TOK_CEO")]);
+        assert_eq!(lookup("TOK_GLOBAL_ONLY", &agents), None);
+    }
+
+    #[test]
+    fn no_agents_means_no_owner() {
+        let agents = agents(&[]);
+        assert_eq!(lookup("TOK_ANY", &agents), None);
+    }
+
+    #[test]
+    fn first_agent_wins_when_multiple_share_token() {
+        let agents = agents(&[("ceo", "TOK_DUP"), ("coo", "TOK_DUP")]);
+        assert_eq!(lookup("TOK_DUP", &agents), Some("ceo"));
     }
 }
 
@@ -3542,6 +3659,11 @@ async fn spawn_claude_cli_with_env(
     // Apply tool restrictions based on agent capabilities (deny-by-default)
     {
         let caps = capabilities.cloned().unwrap_or_default();
+        // HS12: enforce a per-agent allowlist when configured.
+        let allowed = caps.allowed_tools();
+        if !allowed.is_empty() {
+            cmd.args(["--allowedTools", &allowed.join(",")]);
+        }
         let denied = caps.disallowed_tools();
         if !denied.is_empty() {
             let denied_csv = denied.join(",");
@@ -4211,6 +4333,12 @@ fn build_claude_cli_args(
     ]);
 
     let caps = capabilities.cloned().unwrap_or_default();
+    // HS12: enforce a per-agent allowlist when configured.
+    let allowed = caps.allowed_tools();
+    if !allowed.is_empty() {
+        args.push("--allowedTools".to_string());
+        args.push(allowed.join(","));
+    }
     let denied = caps.disallowed_tools();
     if !denied.is_empty() {
         args.push("--disallowedTools".to_string());
@@ -4554,7 +4682,11 @@ async fn invoke_pty_branch(
             false, // bare_mode
         )
         .account_id(account_id.as_deref())
-        .model(Some(model));
+        .model(Some(model))
+        // HS14: pass the rotator-resolved per-account env (OAuth token /
+        // config dir) so the managed worker spawns the child under the
+        // correct account instead of a shared ambient OAuth.
+        .env(env_vars.clone());
         crate::pty_runtime::acquire_and_invoke_with(
             crate::pty_runtime::InvokeOptions::new(acquire, user_message, deadline),
         )
@@ -4723,148 +4855,27 @@ This likely indicates an attacker-controlled name flood or a config bug producin
     leaked
 }
 
-// ── Python SDK subprocess (fallback) ────────────────────────
+// ── Direct API delegate (Rust-native) ───────────────────────
 
-/// Find the Python source path for `duduclaw.sdk.chat`.
-fn find_python_path(home_dir: &Path) -> String {
-    find_python_path_static(home_dir)
-}
-
-/// Public version usable from other modules (e.g. handlers).
-pub fn find_python_path_static(home_dir: &Path) -> String {
-    // Try common locations
-    let mut candidates = vec![
-        // Installed via pip
-        String::new(), // use system PYTHONPATH
-        // Development: project root python/
-        home_dir
-            .parent()
-            .unwrap_or(home_dir)
-            .join("python")
-            .to_string_lossy()
-            .to_string(),
-    ];
-    #[cfg(not(windows))]
-    {
-        // Homebrew / source install
-        candidates.push("/opt/duduclaw".to_string());
-        // Homebrew Cellar (Apple Silicon)
-        candidates.push("/opt/homebrew/opt/duduclaw-pro/libexec/python".to_string());
-        // Homebrew Cellar (Intel Mac)
-        candidates.push("/usr/local/opt/duduclaw-pro/libexec/python".to_string());
-    }
-    #[cfg(windows)]
-    {
-        if let Ok(appdata) = std::env::var("LOCALAPPDATA") {
-            candidates.push(format!("{appdata}\\Programs\\duduclaw\\python"));
-        }
-    }
-    // User-local fallback
-    candidates.push(home_dir.join(".duduclaw").join("python").to_string_lossy().to_string());
-
-    for path in &candidates {
-        if !path.is_empty() && Path::new(path).join("duduclaw").exists() {
-            return path.clone();
-        }
-    }
-
-    // Fallback: return existing PYTHONPATH
-    std::env::var("PYTHONPATH").unwrap_or_default()
-}
-
-/// Delegate execution — spawn Python subprocess with a given prompt and return the response.
-pub async fn call_python_sdk_delegate(
+/// Synchronous delegation helper: call the Anthropic Messages API directly
+/// using the configured API key. Replaces the former Python SDK subprocess
+/// bridge (`duduclaw.sdk.chat`) so the gateway has no runtime Python
+/// dependency. Returns an error when no API key is configured — OAuth-only
+/// setups should delegate via the CLI/PTY path instead.
+pub async fn call_direct_api_delegate(
     prompt: &str,
     model: &str,
     system_prompt: &str,
     home_dir: &Path,
 ) -> Result<String, String> {
-    call_python_sdk_v2(prompt, model, system_prompt, home_dir, None).await
+    let api_key = get_api_key(home_dir)
+        .await
+        .ok_or_else(|| "No API key configured for Direct API delegation".to_string())?;
+    let resp =
+        crate::direct_api::call_direct_api(&api_key, model, system_prompt, prompt, &[]).await?;
+    Ok(resp.text)
 }
 
-/// Call the Python Claude Code SDK via subprocess.
-///
-/// The Python SDK uses the `anthropic` package with the `AccountRotator`
-/// for multi-account rotation, budget tracking, and error recovery.
-///
-/// When `api_key` is provided, it is injected as `ANTHROPIC_API_KEY` env var
-/// into the subprocess so the Python SDK can authenticate even when
-/// `config.toml` has no `[[accounts]]` entries.
-async fn call_python_sdk_v2(
-    user_message: &str,
-    model: &str,
-    system_prompt: &str,
-    home_dir: &Path,
-    api_key: Option<&str>,
-) -> Result<String, String> {
-    use tokio::io::AsyncWriteExt;
-    use tokio::process::Command;
-
-    let prompt_file = home_dir.join(format!(".tmp_system_prompt_{}.md", uuid::Uuid::new_v4()));
-    tokio::fs::write(&prompt_file, system_prompt)
-        .await
-        .map_err(|e| format!("Write prompt: {e}"))?;
-
-    let config_path = home_dir.join("config.toml");
-    let python_path = find_python_path(home_dir);
-
-    let mut cmd = Command::new(duduclaw_core::platform::python3_command());
-    cmd.args([
-            "-m",
-            "duduclaw.sdk.chat",
-            "--model",
-            model,
-            "--system-prompt-file",
-            &prompt_file.to_string_lossy(),
-            "--config",
-            &config_path.to_string_lossy(),
-        ])
-        .env("PYTHONPATH", &python_path)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-    // Inject API key if provided by caller (from rotator or config).
-    if let Some(key) = api_key {
-        cmd.env("ANTHROPIC_API_KEY", key);
-    }
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("Spawn python3: {e}"))?;
-
-    // Write user message to stdin
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(user_message.as_bytes())
-            .await
-            .map_err(|e| format!("Write stdin: {e}"))?;
-        drop(stdin); // close stdin to signal EOF
-    }
-
-    let output = child
-        .wait_with_output()
-        .await
-        .map_err(|e| format!("Wait: {e}"))?;
-
-    let _ = tokio::fs::remove_file(&prompt_file).await;
-
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    if !output.status.success() {
-        return Err(format!(
-            "exit {}: {}",
-            output.status.code().unwrap_or(-1),
-            stderr.chars().take(200).collect::<String>()
-        ));
-    }
-
-    if stdout.is_empty() {
-        return Err("Empty response".to_string());
-    }
-
-    Ok(stdout)
-}
 
 // ── Helpers ─────────────────────────────────────────────────
 
@@ -5221,6 +5232,59 @@ async fn get_default_agent(home_dir: &Path) -> Option<String> {
     let general = table.get("general")?.as_table()?;
     let name = general.get("default_agent")?.as_str()?;
     if name.is_empty() { None } else { Some(name.to_string()) }
+}
+
+/// Return the name of the agent that binds `global_token`, if any.
+///
+/// Shared by every token-exclusive channel (Telegram / Slack / Discord) to
+/// decide whether the generic global poller must defer to an agent-bound one.
+/// When a token is configured both globally and on a specific agent, the global
+/// generic poller is skipped: running both fights over the exclusive long-poll /
+/// gateway session (409 Conflict) and the global path routes via `default_agent`
+/// rather than the bound agent, which surfaces as "identity mixing".
+pub(crate) fn find_global_token_owner<'a, I>(global_token: &str, agent_tokens: I) -> Option<&'a str>
+where
+    I: IntoIterator<Item = (&'a str, &'a str)>,
+{
+    agent_tokens
+        .into_iter()
+        .find(|(_, token)| *token == global_token)
+        .map(|(name, _)| name)
+}
+
+/// Validate at startup that `default_agent` (if set) names a real, loaded agent.
+///
+/// A dangling `default_agent` — left over from a renamed or removed agent — does
+/// not error; at routing time it silently falls back to an arbitrary main agent,
+/// which surfaces as "identity mixing" (the wrong agent answers a channel). This
+/// is loud at boot so operators can fix `config.toml` before users notice.
+///
+/// Returns `true` when the configuration is sound (default_agent unset, or set
+/// and resolvable), `false` when it points at a missing agent.
+pub async fn validate_default_agent(
+    home_dir: &Path,
+    registry: &Arc<RwLock<AgentRegistry>>,
+) -> bool {
+    let Some(name) = get_default_agent(home_dir).await else {
+        return true; // unset → main_agent() fallback is intentional
+    };
+    let reg = registry.read().await;
+    if reg.get(&name).is_some() {
+        info!("default_agent '{name}' resolved successfully");
+        return true;
+    }
+    let available: Vec<&str> = reg
+        .list()
+        .iter()
+        .map(|a| a.config.agent.name.as_str())
+        .collect();
+    warn!(
+        "default_agent '{name}' in config.toml does not match any loaded agent \
+         (available: {available:?}) — channel messages without an explicit \
+         binding will fall back to the main agent and may be answered by the \
+         wrong agent. Fix [general] default_agent or remove it."
+    );
+    false
 }
 
 /// Estimate the token count for a piece of text.

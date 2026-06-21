@@ -70,20 +70,12 @@ pub async fn start_slack_bots(
     let mut results = Vec::new();
     let mut seen_tokens: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    // 1. Global bot from config.toml
-    if let (Some(app_token), Some(bot_token)) = (
-        read_slack_token(home_dir, "slack_app_token").await,
-        read_slack_token(home_dir, "slack_bot_token").await,
-    ) {
-        if !app_token.is_empty() && !bot_token.is_empty() {
-            seen_tokens.insert(bot_token.clone());
-            if let Some(handle) = spawn_slack_bot(app_token, bot_token, "slack".into(), None, ctx.clone()).await {
-                results.push(("slack".to_string(), handle));
-            }
-        }
-    }
-
-    // 2. Per-agent bots from agent configs
+    // Collect per-agent tokens FIRST so the global Socket Mode connection can
+    // defer to them. A Slack bot token bound to a specific agent is more
+    // specific than the generic global connection, which routes via
+    // `default_agent` and can answer as the wrong agent ("identity mixing").
+    // When the same token is configured both globally and per-agent we keep
+    // only the agent-bound connection.
     let agent_tokens: Vec<(String, String, String)> = {
         let reg = ctx.registry.read().await;
         let mut tokens = Vec::new();
@@ -100,10 +92,35 @@ pub async fn start_slack_bots(
         }
         tokens
     };
+    // 1. Global bot from config.toml — skipped when an agent already owns the
+    //    same bot token (the per-agent connection below is authoritative).
+    if let (Some(app_token), Some(bot_token)) = (
+        read_slack_token(home_dir, "slack_app_token").await,
+        read_slack_token(home_dir, "slack_bot_token").await,
+    ) {
+        if !app_token.is_empty() && !bot_token.is_empty() {
+            if let Some(owner) = crate::channel_reply::find_global_token_owner(
+                &bot_token,
+                agent_tokens.iter().map(|(n, _, bot)| (n.as_str(), bot.as_str())),
+            ) {
+                warn!(
+                    "Slack global bot token is also bound to agent '{owner}' — \
+                     skipping the global connection to avoid identity mixing; \
+                     the per-agent bot is authoritative"
+                );
+            } else {
+                seen_tokens.insert(bot_token.clone());
+                if let Some(handle) = spawn_slack_bot(app_token, bot_token, "slack".into(), None, ctx.clone()).await {
+                    results.push(("slack".to_string(), handle));
+                }
+            }
+        }
+    }
 
+    // 2. Per-agent bots (dedup among agents themselves — first claim wins).
     for (agent_name, app_token, bot_token) in agent_tokens {
         if seen_tokens.contains(&bot_token) {
-            info!("Slack bot for agent '{agent_name}' shares global token — skipping duplicate");
+            info!("Slack bot for agent '{agent_name}' shares an already-claimed token — skipping duplicate");
             continue;
         }
         seen_tokens.insert(bot_token.clone());
@@ -461,18 +478,43 @@ async fn remove_reaction_add_done(http: &reqwest::Client, token: &str, channel: 
         .await;
 }
 
-/// Split a message into chunks of max_len characters, respecting line boundaries.
+/// Split a message into chunks of at most `max_len` bytes, respecting line
+/// boundaries. Byte offsets are snapped to UTF-8 char boundaries.
+///
+/// L9: a long CJK run with no newline would previously slice `text[start..end]`
+/// mid-character and panic. `truncate_bytes` walks back to the nearest char
+/// boundary, so the split is always safe.
 fn split_message(text: &str, max_len: usize) -> Vec<&str> {
     let mut chunks = Vec::new();
     let mut start = 0;
     while start < text.len() {
-        let end = (start + max_len).min(text.len());
-        let chunk_end = if end < text.len() {
-            // Find last newline within range
-            text[start..end].rfind('\n').map(|i| start + i + 1).unwrap_or(end)
+        let remaining = &text[start..];
+        // Char-boundary-safe end within the byte budget.
+        let safe = truncate_bytes(remaining, max_len);
+        let safe_len = safe.len();
+        let reached_end = start + safe_len >= text.len();
+
+        let chunk_end = if !reached_end {
+            // Prefer to break at the last newline within the safe window.
+            match safe.rfind('\n') {
+                Some(i) => start + i + 1,
+                None => start + safe_len,
+            }
         } else {
-            end
+            text.len()
         };
+
+        // Guard forward progress: a single char wider than max_len, or a
+        // pathological input, must still advance by at least one char.
+        let chunk_end = if chunk_end <= start {
+            match remaining.char_indices().nth(1) {
+                Some((i, _)) => start + i,
+                None => text.len(),
+            }
+        } else {
+            chunk_end
+        };
+
         chunks.push(&text[start..chunk_end]);
         start = chunk_end;
     }
@@ -540,6 +582,21 @@ mod tests {
         let chunks = split_message(text, 12);
         assert_eq!(chunks.len(), 3);
         assert!(chunks[0].ends_with('\n'));
+    }
+
+    #[test]
+    fn test_split_message_cjk_no_newline_no_panic() {
+        // L9: a long CJK run with no newline must not panic on a char boundary.
+        // Each CJK char is 3 bytes; max_len=10 lands mid-char repeatedly.
+        let text = "你好世界這是一段很長的中文訊息沒有換行符號".repeat(20);
+        let chunks = split_message(&text, 10);
+        // Reassembling the chunks must reproduce the original exactly (no loss).
+        let joined: String = chunks.concat();
+        assert_eq!(joined, text);
+        // Every chunk is valid UTF-8 (slicing succeeded) and within budget-ish.
+        for c in &chunks {
+            assert!(!c.is_empty());
+        }
     }
 
     #[test]

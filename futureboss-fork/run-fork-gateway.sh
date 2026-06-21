@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 自編 fork gateway 啟停/回滾腳本
-# 用途：用「含 Telegram typing + 去 Markdown 修正」的自編 binary 取代官方 v1.20.0 來跑 gateway。
+# 用途：用「含 Telegram typing + 去 Markdown 修正」的自編 binary（基於上游 v1.22.1）取代官方安裝版來跑 gateway。
 # binary：futureboss-fork/target/release/duduclaw（cargo build --release -p duduclaw-cli --bin duduclaw）
 # home： ~/.duduclaw（沿用既有 agent/token/Telegram 設定）
 # port： 127.0.0.1:18789
@@ -54,7 +54,7 @@ case "${1:-start}" in
     stop_current
     ;;
   rollback)
-    # 停自編，改回官方 v1.20.0
+    # 停自編，改回官方安裝版（Homebrew/npm PATH 內的 duduclaw）
     stop_current
     echo "啟動官方 gateway：$OFFICIAL"
     nohup "$OFFICIAL" gateway > "$HOME/.duduclaw/gateway.log" 2>&1 &

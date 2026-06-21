@@ -351,22 +351,45 @@ pub async fn call_claude_for_agent_with_type(
     // (Codex / Gemini / OpenAI-compat). Claude keeps the optimized rotation +
     // local/hybrid path below. This makes sub-agent delegation respect the
     // responding agent's runtime — and is the foundation A2A (Phase 3) builds on.
-    let runtime_provider = crate::runtime_config::agent_runtime_provider(&agent_dir);
-    if runtime_provider != duduclaw_core::types::RuntimeType::Claude {
+    // Parse agent.toml once for the routing decision and the choke-point (L7 followup).
+    let delegation_settings = crate::runtime_config::load_runtime_settings(&agent_dir);
+    if let Some(provider) = delegation_settings.non_claude_provider() {
         info!(
             agent = %agent_id,
-            provider = runtime_provider.as_str(),
+            provider = provider.as_str(),
             "delegation: routing through multi-runtime choke-point (non-Claude provider)"
         );
+        // RFC-25 A2: non-Claude runtimes have no separate uncached secondary
+        // system block (that's a Direct-API cache optimization). Inline the
+        // pending-tasks section into the system prompt — the same content and
+        // format the Claude CLI / local paths concatenate below — so non-Claude
+        // sub-agents still open each turn aware of their Task-Board queue.
+        // (`cli_bare_mode` is a Claude-CLI `--bare` flag with no equivalent on
+        // other runtimes, so it does not apply here.)
+        let system_with_tasks = match &tasks_suffix {
+            Some(s) => std::borrow::Cow::Owned(format!("{system_prompt}\n\n---\n\n{s}")),
+            None => std::borrow::Cow::Borrowed(system_prompt.as_str()),
+        };
         return crate::runtime_dispatch::run_agent_prompt_text(
             crate::runtime_dispatch::AgentPrompt {
                 agent_dir: Some(&agent_dir),
                 home_dir,
                 agent_id,
                 prompt,
-                system_prompt: &system_prompt,
+                system_prompt: &system_with_tasks,
                 model: &claude_model,
                 max_tokens: 8192,
+                provider_override: None,
+                // Single-shot by design: delegation / cron / reminder / A2A
+                // dispatch a discrete task prompt, not a conversation — the same
+                // is true for the Claude path here and the Direct-API path
+                // (see the `&[]` at try_direct_api), so this is symmetric across
+                // providers, not a non-Claude amnesia gap. Multi-turn history is
+                // a channel-reply concept (where a session exists) and is wired
+                // there (A1).
+                conversation_history: &[],
+                request_type: crate::cost_telemetry::RequestType::Dispatch,
+                runtime_settings: Some(&delegation_settings),
             },
         )
         .await;
@@ -1346,15 +1369,29 @@ fn prepare_claude_cmd(
         // Prior to v1.8.30 only `mcp__duduclaw__*` was listed, which meant
         // `WebSearch` / `WebFetch` (Anthropic server-side) silently returned
         // 0 results for cron researcher agents even though they work fine in
-        // interactive Claude Code. Explicitly listing them here restores
-        // research capability without opening up arbitrary code execution.
-        "--allowedTools", "mcp__duduclaw__*,WebSearch,WebFetch,Read,Write,Edit,Glob,Grep,Bash,TodoWrite",
+        // interactive Claude Code. The allowlist is applied below so a
+        // per-agent `allowed_tools` override (HS12) can narrow it.
         // Allow enough agentic turns for complex tasks (read → think → write).
         "--max-turns", "50",
     ]);
 
     // Apply tool restrictions based on agent capabilities (deny-by-default)
     let caps = capabilities.cloned().unwrap_or_default();
+
+    // HS12: honor a per-agent `allowed_tools` override. When configured, it
+    // becomes the ONLY auto-approved set (Claude Code allowlist mode), so an
+    // operator can pin a sub-agent to e.g. `["Read"]`. When unset, fall back to
+    // the curated default that restores WebSearch/WebFetch research capability.
+    const DEFAULT_ALLOWED_TOOLS: &str =
+        "mcp__duduclaw__*,WebSearch,WebFetch,Read,Write,Edit,Glob,Grep,Bash,TodoWrite";
+    let allowed = caps.allowed_tools();
+    let allowed_csv = if allowed.is_empty() {
+        DEFAULT_ALLOWED_TOOLS.to_string()
+    } else {
+        allowed.join(",")
+    };
+    cmd.args(["--allowedTools", &allowed_csv]);
+
     let denied = caps.disallowed_tools();
     if !denied.is_empty() {
         let denied_csv = denied.join(",");

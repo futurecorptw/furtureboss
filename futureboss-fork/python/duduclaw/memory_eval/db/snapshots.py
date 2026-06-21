@@ -11,8 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from datetime import date, datetime, timezone
-from typing import Optional
+from datetime import date
 
 import asyncpg
 
@@ -92,9 +91,13 @@ async def take_memory_snapshot(
                     mem.layer,
                     snapshot_source,
                 )
-                # asyncpg returns "INSERT 0 N" string; count successes
-                if result == "INSERT 0 1":
-                    inserted_count += 1
+                # asyncpg INSERT status is "INSERT <oid> <rowcount>"; parse the
+                # trailing rowcount instead of matching the exact "INSERT 0 1"
+                # string (oid may be non-zero on tables created WITH OIDS).
+                if result.startswith("INSERT"):
+                    parts = result.split()
+                    if len(parts) >= 3 and parts[-1].isdigit():
+                        inserted_count += int(parts[-1])
 
     logger.info(
         "take_memory_snapshot: inserted=%d, batch_id=%s, agent=%s",

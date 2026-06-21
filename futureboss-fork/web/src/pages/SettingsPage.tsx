@@ -4,12 +4,36 @@ import { useSearchParams } from 'react-router';
 import { cn } from '@/lib/utils';
 import { useSystemStore } from '@/stores/system-store';
 import { useAgentsStore } from '@/stores/agents-store';
-import { api, type AutopilotRule, type AutopilotHistoryEntry } from '@/lib/api';
-import { Dialog, FormField, inputClass, buttonPrimary, buttonSecondary } from '@/components/shared/Dialog';
+import {
+  api,
+  type AutopilotRule,
+  type AutopilotHistoryEntry,
+  type RedactionConfig,
+  type RedactionSourceMode,
+  type RedactionSources,
+  type RedactionRestoreArgs,
+  type RedactionEgressRule,
+  type RedactionUpdate,
+  type SkillSynthesisConfig,
+} from '@/lib/api';
+import { Dialog, FormField, inputClass, selectClass, buttonPrimary, buttonSecondary } from '@/components/shared/Dialog';
+import { ChipEditor } from '@/components/shared/ChipEditor';
 import { toast, formatError } from '@/lib/toast';
 import { ToolApprovalPanel } from '@/components/ToolApprovalPanel';
 import { SessionReplayPanel } from '@/components/SessionReplayPanel';
 import { BrowserAuditPanel } from '@/components/BrowserAuditPanel';
+import {
+  Page,
+  PageHeader,
+  Card,
+  Section,
+  Tabs,
+  Button,
+  Badge,
+  EmptyState,
+  Field,
+  controlClass,
+} from '@/components/ui';
 import {
   Settings,
   Container,
@@ -30,9 +54,14 @@ import {
   Workflow,
   Globe,
   Pencil,
+  EyeOff,
+  Trash2,
+  Server,
+  Sparkles,
+  ExternalLink,
 } from 'lucide-react';
 
-type TabId = 'general' | 'container' | 'heartbeat' | 'cron' | 'voice' | 'proactive' | 'autopilot' | 'doctor' | 'update' | 'browser';
+type TabId = 'general' | 'system' | 'container' | 'heartbeat' | 'cron' | 'voice' | 'proactive' | 'autopilot' | 'skillSynthesis' | 'redaction' | 'doctor' | 'update' | 'browser';
 
 export function SettingsPage() {
   const intl = useIntl();
@@ -42,55 +71,47 @@ export function SettingsPage() {
 
   const tabs: ReadonlyArray<{ id: TabId; label: string; icon: React.ComponentType<{ className?: string }> }> = [
     { id: 'general', label: intl.formatMessage({ id: 'settings.general' }), icon: Settings },
+    { id: 'system', label: intl.formatMessage({ id: 'settings.system' }), icon: Server },
     { id: 'container', label: intl.formatMessage({ id: 'settings.container' }), icon: Container },
     { id: 'heartbeat', label: intl.formatMessage({ id: 'settings.heartbeat' }), icon: HeartPulse },
     { id: 'voice', label: intl.formatMessage({ id: 'settings.voice' }), icon: Mic },
     { id: 'proactive', label: intl.formatMessage({ id: 'settings.proactive' }), icon: Zap },
     { id: 'autopilot', label: intl.formatMessage({ id: 'settings.autopilot' }), icon: Workflow },
+    { id: 'skillSynthesis', label: intl.formatMessage({ id: 'settings.skillSynthesis' }), icon: Sparkles },
+    { id: 'redaction', label: intl.formatMessage({ id: 'settings.redaction' }), icon: EyeOff },
     { id: 'doctor', label: intl.formatMessage({ id: 'settings.doctor' }), icon: Stethoscope },
     { id: 'update', label: intl.formatMessage({ id: 'settings.update' }), icon: Download },
     { id: 'browser', label: intl.formatMessage({ id: 'settings.browser' }), icon: Globe },
   ];
 
   return (
-    <div className="space-y-6">
-      <h2 className="text-2xl font-semibold text-stone-900 dark:text-stone-50">
-        {intl.formatMessage({ id: 'settings.title' })}
-      </h2>
+    <Page wide>
+      <PageHeader
+        icon={Settings}
+        title={intl.formatMessage({ id: 'nav.settings' })}
+        subtitle={intl.formatMessage({ id: 'settings.title' })}
+      />
 
-      {/* Tabs */}
-      <div className="flex gap-1 overflow-x-auto rounded-lg bg-stone-100 p-1 dark:bg-stone-800">
-        {tabs.map((tab) => {
-          const TabIcon = tab.icon;
-          return (
-            <button
-              key={tab.id}
-              onClick={() => setActiveTab(tab.id)}
-              className={cn(
-                'flex items-center gap-2 whitespace-nowrap rounded-md px-4 py-2 text-sm font-medium transition-colors',
-                activeTab === tab.id
-                  ? 'bg-white text-stone-900 shadow-sm dark:bg-stone-700 dark:text-stone-50'
-                  : 'text-stone-500 hover:text-stone-700 dark:text-stone-400 dark:hover:text-stone-300'
-              )}
-            >
-              <TabIcon className="h-4 w-4" />
-              {tab.label}
-            </button>
-          );
-        })}
-      </div>
+      <Tabs
+        items={tabs}
+        value={activeTab}
+        onChange={(id) => setActiveTab(id as TabId)}
+      />
 
       {activeTab === 'general' && <GeneralTab />}
+      {activeTab === 'system' && <SystemTab />}
       {activeTab === 'container' && <ContainerTab />}
       {activeTab === 'heartbeat' && <HeartbeatTab />}
       {activeTab === 'cron' && <CronTab />}
       {activeTab === 'voice' && <VoiceTab />}
       {activeTab === 'proactive' && <ProactiveTab />}
       {activeTab === 'autopilot' && <AutopilotTab />}
+      {activeTab === 'skillSynthesis' && <SkillSynthesisTab />}
+      {activeTab === 'redaction' && <RedactionTab />}
       {activeTab === 'doctor' && <DoctorTab />}
       {activeTab === 'update' && <UpdateTab />}
       {activeTab === 'browser' && <BrowserTab />}
-    </div>
+    </Page>
   );
 }
 
@@ -136,14 +157,10 @@ function GeneralTab() {
     }
   };
 
-  const selectStyle = 'rounded-lg border border-stone-300 bg-white px-3 py-1.5 text-sm text-stone-900 focus:border-amber-500 focus:outline-none dark:border-stone-600 dark:bg-stone-800 dark:text-stone-50';
+  const selectStyle = cn(controlClass, 'w-auto min-w-[10rem]');
 
   return (
-    <div className="glass-card rounded-2xl p-6">
-      <h3 className="mb-4 text-lg font-medium text-stone-900 dark:text-stone-50">
-        {intl.formatMessage({ id: 'settings.general' })}
-      </h3>
-
+    <Card title={intl.formatMessage({ id: 'settings.general' })}>
       <div className="space-y-4">
         <SettingRow label="Gateway Address" value={status?.gateway_address ?? '0.0.0.0:3100'} />
         <SettingRow label="Version" value={status?.version ?? '-'} />
@@ -153,7 +170,7 @@ function GeneralTab() {
         />
 
         {/* Editable: Log Level */}
-        <div className="flex items-center justify-between border-b border-stone-100 pb-3 dark:border-stone-800">
+        <div className="flex items-center justify-between border-b border-[var(--panel-border)] pb-3">
           <span className="text-sm text-stone-600 dark:text-stone-400">
             {intl.formatMessage({ id: 'settings.general.logLevel' })}
           </span>
@@ -165,7 +182,7 @@ function GeneralTab() {
         </div>
 
         {/* Editable: Rotation Strategy */}
-        <div className="flex items-center justify-between border-b border-stone-100 pb-3 last:border-0 dark:border-stone-800">
+        <div className="flex items-center justify-between border-b border-[var(--panel-border)] pb-3 last:border-0">
           <span className="text-sm text-stone-600 dark:text-stone-400">
             {intl.formatMessage({ id: 'settings.general.rotationStrategy' })}
           </span>
@@ -178,16 +195,200 @@ function GeneralTab() {
         </div>
 
         {/* Save button */}
-        <div className="flex justify-end gap-2 pt-2">
+        <div className="flex items-center justify-end gap-2 pt-2">
           {saved && (
-            <span className="self-center text-xs text-emerald-600 dark:text-emerald-400">
+            <span className="text-xs text-emerald-600 dark:text-emerald-400">
               {intl.formatMessage({ id: 'settings.general.saved' })}
             </span>
           )}
-          <button onClick={handleSave} disabled={saving} className="inline-flex items-center gap-2 rounded-lg bg-amber-500 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-amber-600 disabled:opacity-50">
+          <Button variant="primary" onClick={handleSave} disabled={saving}>
             {saving ? intl.formatMessage({ id: 'common.saving' }) : intl.formatMessage({ id: 'common.save' })}
-          </button>
+          </Button>
         </div>
+      </div>
+    </Card>
+  );
+}
+
+// ── G — System tab (gateway / rotation / general / logging / secret_manager) ──
+
+function SystemTab() {
+  const intl = useIntl();
+  const { agents, fetchAgents } = useAgentsStore();
+  // [gateway] — bind/port require restart; auth_token is write-only.
+  const [bind, setBind] = useState('');
+  const [port, setPort] = useState('');
+  const [authToken, setAuthToken] = useState('');
+  // [rotation]
+  const [healthInterval, setHealthInterval] = useState('');
+  const [cooldown, setCooldown] = useState('');
+  // [general]
+  const [defaultAgent, setDefaultAgent] = useState('');
+  const [inferenceMode, setInferenceMode] = useState('claude');
+  // [logging]
+  const [logFormat, setLogFormat] = useState('pretty');
+  // [secret_manager]
+  const [smBackend, setSmBackend] = useState('config');
+  const [vaultAddr, setVaultAddr] = useState('');
+  const [vaultMount, setVaultMount] = useState('');
+  const [vaultToken, setVaultToken] = useState('');
+
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const savedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => { if (savedTimerRef.current) clearTimeout(savedTimerRef.current); }, []);
+
+  useEffect(() => { fetchAgents(); }, [fetchAgents]);
+
+  // Load non-secret current values from the TOML config string. Secrets
+  // (auth_token / vault_token) are write-only — left blank, only sent if typed.
+  useEffect(() => {
+    api.system.config().then((res) => {
+      const raw = (res as Record<string, unknown>)?.config;
+      if (typeof raw !== 'string') return;
+      const m = (re: RegExp) => raw.match(re)?.[1];
+      setBind(m(/\bbind\s*=\s*"([^"]*)"/) ?? '');
+      setPort(m(/\bport\s*=\s*(\d+)/) ?? '');
+      setHealthInterval(m(/health_check_interval_seconds\s*=\s*(\d+)/) ?? '');
+      setCooldown(m(/cooldown_after_rate_limit_seconds\s*=\s*(\d+)/) ?? '');
+      setDefaultAgent(m(/default_agent\s*=\s*"([^"]*)"/) ?? '');
+      setInferenceMode(m(/inference_mode\s*=\s*"(\w+)"/) ?? 'claude');
+      setLogFormat(m(/\bformat\s*=\s*"(\w+)"/) ?? 'pretty');
+      setSmBackend(m(/\bbackend\s*=\s*"(\w+)"/) ?? 'config');
+      setVaultAddr(m(/vault_addr\s*=\s*"([^"]*)"/) ?? '');
+      setVaultMount(m(/vault_mount\s*=\s*"([^"]*)"/) ?? '');
+    }).catch((e) => {
+      console.warn('[api]', e);
+      toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
+    });
+  }, [intl]);
+
+  const handleSave = async () => {
+    setSaving(true);
+    setSaved(false);
+    try {
+      const payload: Record<string, unknown> = {};
+      if (bind.trim() !== '') payload.bind = bind.trim();
+      if (port.trim() !== '') payload.port = Number(port);
+      if (authToken.trim() !== '') payload.auth_token = authToken.trim();
+      if (healthInterval.trim() !== '') payload.health_check_interval_seconds = Number(healthInterval);
+      if (cooldown.trim() !== '') payload.cooldown_after_rate_limit_seconds = Number(cooldown);
+      payload.default_agent = defaultAgent;
+      payload.inference_mode = inferenceMode;
+      payload.log_format = logFormat;
+      const sm: Record<string, unknown> = { backend: smBackend, vault_addr: vaultAddr, vault_mount: vaultMount };
+      if (vaultToken.trim() !== '') sm.vault_token = vaultToken.trim();
+      payload.secret_manager = sm;
+
+      await api.system.updateConfig(payload);
+      setAuthToken('');
+      setVaultToken('');
+      setSaved(true);
+      savedTimerRef.current = setTimeout(() => setSaved(false), 2000);
+    } catch (e) {
+      console.warn('[api]', e);
+      toast.error(intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: formatError(e) }));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="space-y-6">
+      {/* Gateway */}
+      <Card title={intl.formatMessage({ id: 'settings.system.gateway' })} bodyClassName="space-y-4">
+        <div className="flex items-start gap-2 rounded-lg bg-amber-500/10 p-3 text-xs text-amber-700 ring-1 ring-inset ring-amber-500/20 dark:text-amber-400">
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+          <span>{intl.formatMessage({ id: 'settings.system.restartNote' })}</span>
+        </div>
+        <div className="grid grid-cols-2 gap-3">
+          <FormField label={intl.formatMessage({ id: 'settings.system.bind' })}>
+            <input type="text" value={bind} onChange={(e) => setBind(e.target.value)} placeholder="0.0.0.0" className={inputClass} />
+          </FormField>
+          <FormField label={intl.formatMessage({ id: 'settings.system.port' })}>
+            <input type="number" min={1} max={65535} value={port} onChange={(e) => setPort(e.target.value)} placeholder="3100" className={inputClass} />
+          </FormField>
+        </div>
+        <FormField label={intl.formatMessage({ id: 'settings.system.authToken' })} hint={intl.formatMessage({ id: 'settings.system.writeOnly' })}>
+          <input type="password" value={authToken} onChange={(e) => setAuthToken(e.target.value)} placeholder="••••••••" className={inputClass} autoComplete="off" />
+        </FormField>
+      </Card>
+
+      {/* Rotation */}
+      <Card title={intl.formatMessage({ id: 'settings.system.rotation' })} bodyClassName="space-y-4">
+        <div className="grid grid-cols-2 gap-3">
+          <FormField label={intl.formatMessage({ id: 'settings.system.healthInterval' })}>
+            <input type="number" min={1} max={86400} value={healthInterval} onChange={(e) => setHealthInterval(e.target.value)} placeholder="60" className={inputClass} />
+          </FormField>
+          <FormField label={intl.formatMessage({ id: 'settings.system.cooldown' })}>
+            <input type="number" min={1} max={86400} value={cooldown} onChange={(e) => setCooldown(e.target.value)} placeholder="120" className={inputClass} />
+          </FormField>
+        </div>
+      </Card>
+
+      {/* General + Logging */}
+      <Card title={intl.formatMessage({ id: 'settings.system.general' })} bodyClassName="space-y-4">
+        <FormField label={intl.formatMessage({ id: 'settings.system.defaultAgent' })}>
+          <select value={defaultAgent} onChange={(e) => setDefaultAgent(e.target.value)} className={selectClass}>
+            <option value="">{intl.formatMessage({ id: 'settings.system.none' })}</option>
+            {agents.map((a) => (
+              <option key={a.name} value={a.name}>{a.display_name || a.name}</option>
+            ))}
+          </select>
+        </FormField>
+        <div className="grid grid-cols-2 gap-3">
+          <FormField label={intl.formatMessage({ id: 'settings.system.inferenceMode' })}>
+            <select value={inferenceMode} onChange={(e) => setInferenceMode(e.target.value)} className={selectClass}>
+              <option value="local">local</option>
+              <option value="claude">claude</option>
+              <option value="hybrid">hybrid</option>
+            </select>
+          </FormField>
+          <FormField label={intl.formatMessage({ id: 'settings.system.logFormat' })}>
+            <select value={logFormat} onChange={(e) => setLogFormat(e.target.value)} className={selectClass}>
+              <option value="pretty">pretty</option>
+              <option value="json">json</option>
+            </select>
+          </FormField>
+        </div>
+      </Card>
+
+      {/* Secret manager */}
+      <Card title={intl.formatMessage({ id: 'settings.system.secrets' })} bodyClassName="space-y-4">
+        <FormField label={intl.formatMessage({ id: 'settings.system.smBackend' })}>
+          <select value={smBackend} onChange={(e) => setSmBackend(e.target.value)} className={selectClass}>
+            <option value="env">env</option>
+            <option value="vault">vault</option>
+            <option value="config">config</option>
+            <option value="keychain">keychain</option>
+          </select>
+        </FormField>
+        {smBackend === 'vault' && (
+          <>
+            <div className="grid grid-cols-2 gap-3">
+              <FormField label={intl.formatMessage({ id: 'settings.system.vaultAddr' })}>
+                <input type="text" value={vaultAddr} onChange={(e) => setVaultAddr(e.target.value)} placeholder="https://vault:8200" className={inputClass} />
+              </FormField>
+              <FormField label={intl.formatMessage({ id: 'settings.system.vaultMount' })}>
+                <input type="text" value={vaultMount} onChange={(e) => setVaultMount(e.target.value)} placeholder="secret" className={inputClass} />
+              </FormField>
+            </div>
+            <FormField label={intl.formatMessage({ id: 'settings.system.vaultToken' })} hint={intl.formatMessage({ id: 'settings.system.writeOnly' })}>
+              <input type="password" value={vaultToken} onChange={(e) => setVaultToken(e.target.value)} placeholder="••••••••" className={inputClass} autoComplete="off" />
+            </FormField>
+          </>
+        )}
+      </Card>
+
+      <div className="flex items-center justify-end gap-2">
+        {saved && (
+          <span className="text-xs text-emerald-600 dark:text-emerald-400">
+            {intl.formatMessage({ id: 'settings.general.saved' })}
+          </span>
+        )}
+        <Button variant="primary" onClick={handleSave} disabled={saving}>
+          {saving ? intl.formatMessage({ id: 'common.saving' }) : intl.formatMessage({ id: 'common.save' })}
+        </Button>
       </div>
     </div>
   );
@@ -197,20 +398,20 @@ function ContainerTab() {
   const intl = useIntl();
 
   return (
-    <div className="glass-card rounded-2xl p-6">
-      <div className="flex items-center gap-3 mb-4">
-        <Container className="h-5 w-5 text-amber-600 dark:text-amber-400" />
-        <h3 className="text-lg font-medium text-stone-900 dark:text-stone-50">
+    <Card
+      title={
+        <span className="flex items-center gap-2">
+          <Container className="h-4 w-4 text-amber-500" />
           {intl.formatMessage({ id: 'settings.container' })}
-        </h3>
-      </div>
-
+        </span>
+      }
+    >
       <div className="space-y-4">
         <SettingRow label="Engine" value="Docker" />
         <SettingRow label="Socket" value="/var/run/docker.sock" />
         <SettingRow label="Status" value="Detected" badge="emerald" />
       </div>
-    </div>
+    </Card>
   );
 }
 
@@ -250,24 +451,25 @@ function HeartbeatTab() {
   }, [intl]);
 
   return (
-    <div className="glass-card rounded-2xl p-6">
-      <div className="flex items-center gap-3 mb-4">
-        <HeartPulse className="h-5 w-5 text-amber-600 dark:text-amber-400" />
-        <h3 className="text-lg font-medium text-stone-900 dark:text-stone-50">
+    <Card
+      title={
+        <span className="flex items-center gap-2">
+          <HeartPulse className="h-4 w-4 text-amber-500" />
           {intl.formatMessage({ id: 'settings.heartbeat' })}
-        </h3>
-      </div>
-
+        </span>
+      }
+    >
       {heartbeats.length === 0 ? (
-        <p className="py-8 text-center text-sm text-stone-400">
-          {intl.formatMessage({ id: 'common.noData' })}
-        </p>
+        <EmptyState
+          icon={HeartPulse}
+          title={intl.formatMessage({ id: 'common.noData' })}
+        />
       ) : (
         <div className="space-y-3">
           {heartbeats.map((hb) => (
             <div
               key={hb.agent_id}
-              className="flex items-center justify-between rounded-lg bg-stone-50 p-3 dark:bg-stone-800/50"
+              className="flex items-center justify-between rounded-lg bg-stone-500/5 p-3 dark:bg-white/5"
             >
               <div>
                 <span className="text-sm font-medium text-stone-900 dark:text-stone-100">
@@ -307,7 +509,7 @@ function HeartbeatTab() {
                     console.warn("[api]", e);
                     toast.error(intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: formatError(e) }));
                   })}
-                  className="rounded px-1.5 py-0.5 text-xs text-amber-600 hover:bg-amber-50 dark:text-amber-400 dark:hover:bg-amber-900/20"
+                  className="rounded px-1.5 py-0.5 text-xs text-amber-600 hover:bg-amber-500/10 dark:text-amber-400"
                 >
                   <Play className="h-3 w-3" />
                 </button>
@@ -316,7 +518,7 @@ function HeartbeatTab() {
           ))}
         </div>
       )}
-    </div>
+    </Card>
   );
 }
 
@@ -506,26 +708,23 @@ export function CronTab() {
     }
   };
 
-  const inputStyle = 'rounded-lg border border-stone-300/70 bg-white/60 px-3 py-1.5 text-sm text-stone-900 backdrop-blur focus:border-amber-500 focus:outline-none dark:border-white/10 dark:bg-white/5 dark:text-stone-50';
+  const inputStyle = controlClass;
 
   return (
-    <div className="glass-card rounded-2xl p-6">
-      <div className="flex items-center justify-between mb-4">
-        <div className="flex items-center gap-3">
-          <Clock className="h-5 w-5 text-amber-600 dark:text-amber-400" />
-          <h3 className="text-lg font-medium text-stone-900 dark:text-stone-50">
-            {intl.formatMessage({ id: 'settings.cron' })}
-          </h3>
-        </div>
-        <button
-          onClick={() => setShowAdd(!showAdd)}
-          className="inline-flex items-center gap-1 rounded-lg bg-amber-500 px-3 py-1.5 text-xs font-medium text-white hover:bg-amber-600"
-        >
-          <Plus className="h-3.5 w-3.5" />
+    <Card
+      padded={false}
+      title={
+        <span className="flex items-center gap-2">
+          <Clock className="h-4 w-4 text-amber-500" />
+          {intl.formatMessage({ id: 'settings.cron' })}
+        </span>
+      }
+      actions={
+        <Button variant="primary" size="sm" icon={Plus} onClick={() => setShowAdd(!showAdd)}>
           {intl.formatMessage({ id: 'settings.cron.add' })}
-        </button>
-      </div>
-
+        </Button>
+      }
+    >
       {/* Edit dialog */}
       {editing && (
         <CronEditDialog
@@ -537,8 +736,8 @@ export function CronTab() {
 
       {/* Add task form */}
       {showAdd && (
-        <div className="mb-4 rounded-xl border border-amber-400/30 bg-amber-100/30 p-4 backdrop-blur dark:border-amber-500/20 dark:bg-amber-900/15">
-          <div className="grid gap-3 sm:grid-cols-2">
+        <div className="m-5 mb-0 rounded-xl bg-amber-500/8 p-4 ring-1 ring-inset ring-amber-500/20">
+          <div className="grid gap-3 sm:grid-cols-3">
             <input type="text" placeholder={intl.formatMessage({ id: 'settings.cron.name' })} value={newName} onChange={(e) => setNewName(e.target.value)} className={inputStyle} />
             <input type="text" placeholder="0 * * * *" value={newSchedule} onChange={(e) => setNewSchedule(e.target.value)} className={cn(inputStyle, 'font-mono')} />
             <input type="text" placeholder={intl.formatMessage({ id: 'settings.cron.agent' })} value={newAgent} onChange={(e) => setNewAgent(e.target.value)} className={inputStyle} />
@@ -558,28 +757,29 @@ export function CronTab() {
             placeholder={intl.formatMessage({ id: 'settings.cron.task' })}
             value={newTask}
             onChange={(e) => setNewTask(e.target.value)}
-            className={cn(inputStyle, 'mt-3 w-full')}
+            className={cn(inputStyle, 'mt-3 h-auto w-full py-2')}
           />
           <div className="mt-3 flex justify-end gap-2">
-            <button onClick={() => setShowAdd(false)} className="rounded-lg border border-stone-300/70 px-3 py-1.5 text-xs text-stone-600 dark:border-white/10 dark:text-stone-400">
+            <Button variant="secondary" size="sm" onClick={() => setShowAdd(false)}>
               {intl.formatMessage({ id: 'common.cancel' })}
-            </button>
-            <button onClick={handleAdd} disabled={adding || !newName.trim()} className="rounded-lg bg-amber-500 px-3 py-1.5 text-xs font-medium text-white hover:bg-amber-600 disabled:opacity-50">
+            </Button>
+            <Button variant="primary" size="sm" onClick={handleAdd} disabled={adding || !newName.trim()}>
               {adding ? intl.formatMessage({ id: 'common.saving' }) : intl.formatMessage({ id: 'common.save' })}
-            </button>
+            </Button>
           </div>
         </div>
       )}
 
       {tasks.length === 0 ? (
-        <div className="flex items-center justify-center py-12 text-stone-400 dark:text-stone-500">
-          <p>{intl.formatMessage({ id: 'common.noData' })}</p>
-        </div>
+        <EmptyState
+          icon={Clock}
+          title={intl.formatMessage({ id: 'common.noData' })}
+        />
       ) : (
-        <div className="overflow-x-auto">
+        <div className="overflow-x-auto px-5 pb-2">
           <table className="w-full text-sm">
             <thead>
-              <tr className="border-b border-stone-200 dark:border-stone-700">
+              <tr className="border-b border-[var(--panel-border)]">
                 <th className="py-2 text-left font-medium text-stone-500 dark:text-stone-400">
                   {intl.formatMessage({ id: 'settings.cron.name' })}
                 </th>
@@ -603,7 +803,7 @@ export function CronTab() {
                 return (
                   <tr
                     key={taskId}
-                    className="border-b border-stone-100 dark:border-stone-800"
+                    className="border-b border-[var(--panel-border)] last:border-0"
                   >
                     <td className="py-2 font-mono text-xs text-stone-700 dark:text-stone-300">
                       {taskLabel}
@@ -612,7 +812,7 @@ export function CronTab() {
                       {task.agent_id}
                     </td>
                     <td className="py-2">
-                      <code className="rounded bg-stone-100 px-2 py-0.5 font-mono text-xs text-stone-600 dark:bg-stone-800 dark:text-stone-400">
+                      <code className="rounded bg-stone-500/10 px-2 py-0.5 font-mono text-xs text-stone-600 dark:text-stone-400">
                         {taskCron}
                       </code>
                       <span className="ml-2 text-xs text-stone-400 dark:text-stone-500">
@@ -621,42 +821,34 @@ export function CronTab() {
                     </td>
                     <td className="py-2 text-center">
                       {task.enabled ? (
-                        <span className="inline-flex items-center rounded-full bg-emerald-100 px-2 py-0.5 text-xs font-medium text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400">
-                          {intl.formatMessage({ id: 'settings.cron.enabled' })}
-                        </span>
+                        <Badge tone="success">{intl.formatMessage({ id: 'settings.cron.enabled' })}</Badge>
                       ) : (
-                        <span className="inline-flex items-center rounded-full bg-stone-100 px-2 py-0.5 text-xs font-medium text-stone-600 dark:bg-stone-800 dark:text-stone-400">
-                          {intl.formatMessage({ id: 'settings.cron.disabled' })}
-                        </span>
+                        <Badge tone="neutral">{intl.formatMessage({ id: 'settings.cron.disabled' })}</Badge>
                       )}
                     </td>
                     <td className="py-2 text-right">
                       <div className="flex justify-end gap-1">
-                        <button
-                          onClick={() => setEditing(task)}
-                          className="inline-flex items-center gap-1 rounded px-2 py-1 text-xs text-stone-600 hover:bg-stone-500/10 dark:text-stone-300"
-                        >
-                          <Pencil className="h-3 w-3" />
+                        <Button variant="ghost" size="sm" icon={Pencil} onClick={() => setEditing(task)}>
                           {intl.formatMessage({ id: 'common.edit' })}
-                        </button>
+                        </Button>
                         {task.enabled ? (
                           <button
                             onClick={() => handlePause(taskId)}
-                            className="rounded px-2 py-1 text-xs text-amber-600 hover:bg-amber-50 dark:text-amber-400 dark:hover:bg-amber-900/20"
+                            className="rounded px-2 py-1 text-xs text-amber-600 hover:bg-amber-500/10 dark:text-amber-400"
                           >
                             {intl.formatMessage({ id: 'settings.cron.pause' })}
                           </button>
                         ) : (
                           <button
                             onClick={() => handleResume(taskId)}
-                            className="rounded px-2 py-1 text-xs text-emerald-600 hover:bg-emerald-50 dark:text-emerald-400 dark:hover:bg-emerald-900/20"
+                            className="rounded px-2 py-1 text-xs text-emerald-600 hover:bg-emerald-500/10 dark:text-emerald-400"
                           >
                             {intl.formatMessage({ id: 'settings.cron.resume' })}
                           </button>
                         )}
                         <button
                           onClick={() => handleRemove(taskId)}
-                          className="rounded px-2 py-1 text-xs text-rose-600 hover:bg-rose-50 dark:text-rose-400 dark:hover:bg-rose-900/20"
+                          className="rounded px-2 py-1 text-xs text-rose-600 hover:bg-rose-500/10 dark:text-rose-400"
                         >
                           {intl.formatMessage({ id: 'settings.cron.remove' })}
                         </button>
@@ -669,7 +861,7 @@ export function CronTab() {
           </table>
         </div>
       )}
-    </div>
+    </Card>
   );
 }
 
@@ -699,33 +891,23 @@ function DoctorTab() {
   };
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-6">
       <div className="flex gap-2">
-        <button
-          onClick={runDoctor}
-          disabled={loading}
-          className="inline-flex items-center gap-2 rounded-lg bg-amber-500 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-amber-600 disabled:opacity-50"
-        >
-          <Play className="h-4 w-4" />
+        <Button variant="primary" icon={Play} onClick={runDoctor} disabled={loading}>
           {intl.formatMessage({ id: 'settings.doctor.run' })}
-        </button>
-        <button
-          onClick={handleRepair}
-          disabled={loading}
-          className="inline-flex items-center gap-2 rounded-lg border border-stone-200 bg-white px-4 py-2 text-sm font-medium text-stone-700 transition-colors hover:bg-stone-50 disabled:opacity-50 dark:border-stone-700 dark:bg-stone-800 dark:text-stone-300 dark:hover:bg-stone-700"
-        >
-          <Wrench className="h-4 w-4" />
+        </Button>
+        <Button variant="secondary" icon={Wrench} onClick={handleRepair} disabled={loading}>
           {intl.formatMessage({ id: 'settings.doctor.repair' })}
-        </button>
+        </Button>
       </div>
 
       {doctorChecks.length === 0 ? (
-        <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-stone-300 bg-white py-16 dark:border-stone-700 dark:bg-stone-900">
-          <Stethoscope className="mb-4 h-12 w-12 text-stone-300 dark:text-stone-600" />
-          <p className="text-stone-500 dark:text-stone-400">
-            {intl.formatMessage({ id: 'settings.doctor.run' })}
-          </p>
-        </div>
+        <Card padded={false}>
+          <EmptyState
+            icon={Stethoscope}
+            title={intl.formatMessage({ id: 'settings.doctor.run' })}
+          />
+        </Card>
       ) : (
         <div className="grid gap-3 sm:grid-cols-2">
           {doctorChecks.map((check) => (
@@ -847,10 +1029,10 @@ function UpdateTab() {
   }, [intl]);
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-6">
       {/* Auto-update toggle — Pro only */}
       {isPro && (
-        <div className="glass-card rounded-2xl p-6">
+        <Card>
           <div className="flex items-center justify-between">
             <div>
               <h3 className="text-sm font-medium text-stone-900 dark:text-stone-50">
@@ -870,39 +1052,34 @@ function UpdateTab() {
               <div className="peer h-6 w-11 rounded-full bg-stone-200 after:absolute after:left-[2px] after:top-[2px] after:h-5 after:w-5 after:rounded-full after:bg-white after:transition-all peer-checked:bg-amber-500 peer-checked:after:translate-x-full dark:bg-stone-600" />
             </label>
           </div>
-        </div>
+        </Card>
       )}
 
-      <div className="glass-card rounded-2xl p-6">
-        <div className="flex items-center justify-between mb-6">
-          <div className="flex items-center gap-3">
-            <ArrowUpCircle className="h-5 w-5 text-amber-600 dark:text-amber-400" />
-            <h3 className="text-lg font-medium text-stone-900 dark:text-stone-50">
-              {intl.formatMessage({ id: 'settings.update' })}
-            </h3>
-          </div>
-          <button
-            onClick={handleCheck}
-            disabled={checking}
-            className="inline-flex items-center gap-2 rounded-lg bg-amber-500 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-amber-600 disabled:opacity-50"
-          >
-            <RefreshCw className={cn('h-4 w-4', checking && 'animate-spin')} />
+      <Card
+        title={
+          <span className="flex items-center gap-2">
+            <ArrowUpCircle className="h-4 w-4 text-amber-500" />
+            {intl.formatMessage({ id: 'settings.update' })}
+          </span>
+        }
+        actions={
+          <Button variant="primary" icon={RefreshCw} onClick={handleCheck} disabled={checking}>
             {checking
               ? intl.formatMessage({ id: 'settings.update.checking' })
               : intl.formatMessage({ id: 'settings.update.check' })}
-          </button>
-        </div>
-
+          </Button>
+        }
+      >
         {/* Status display */}
         {!updateInfo && !error && (
-          <div className="flex flex-col items-center justify-center py-12 text-stone-400 dark:text-stone-500">
-            <Download className="mb-4 h-12 w-12 text-stone-300 dark:text-stone-600" />
-            <p>{intl.formatMessage({ id: 'settings.update.check' })}</p>
-          </div>
+          <EmptyState
+            icon={Download}
+            title={intl.formatMessage({ id: 'settings.update.check' })}
+          />
         )}
 
         {error && (
-          <div className="rounded-lg border border-rose-200 bg-rose-50 p-4 dark:border-rose-800 dark:bg-rose-900/20">
+          <div className="rounded-lg bg-rose-500/10 p-4 ring-1 ring-inset ring-rose-500/20">
             <div className="flex items-center gap-2">
               <XCircle className="h-5 w-5 text-rose-500" />
               <span className="text-sm text-rose-700 dark:text-rose-400">{error}</span>
@@ -911,7 +1088,7 @@ function UpdateTab() {
         )}
 
         {installed && (
-          <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-4 dark:border-emerald-800 dark:bg-emerald-900/20">
+          <div className="rounded-lg bg-emerald-500/10 p-4 ring-1 ring-inset ring-emerald-500/20">
             <div className="flex items-center gap-2">
               <CheckCircle className="h-5 w-5 text-emerald-500" />
               <span className="text-sm text-emerald-700 dark:text-emerald-400">
@@ -925,7 +1102,7 @@ function UpdateTab() {
           <div className="space-y-4">
             {/* Version info */}
             <div className="grid gap-3 sm:grid-cols-2">
-              <div className="rounded-lg bg-stone-50 p-4 dark:bg-stone-800/50">
+              <div className="rounded-lg bg-stone-500/5 p-4 dark:bg-white/5">
                 <span className="text-xs text-stone-400">
                   {intl.formatMessage({ id: 'settings.update.current' })}
                 </span>
@@ -934,10 +1111,10 @@ function UpdateTab() {
                 </p>
               </div>
               <div className={cn(
-                'rounded-lg p-4',
+                'rounded-lg p-4 ring-1 ring-inset',
                 updateInfo.available
-                  ? 'bg-amber-50 dark:bg-amber-900/20'
-                  : 'bg-emerald-50 dark:bg-emerald-900/20'
+                  ? 'bg-amber-500/10 ring-amber-500/20'
+                  : 'bg-emerald-500/10 ring-emerald-500/20'
               )}>
                 <span className="text-xs text-stone-400">
                   {intl.formatMessage({ id: 'settings.update.latest' })}
@@ -954,7 +1131,7 @@ function UpdateTab() {
             </div>
 
             {!updateInfo.available && (
-              <div className="flex items-center gap-2 rounded-lg border border-emerald-200 bg-emerald-50 p-4 dark:border-emerald-800 dark:bg-emerald-900/20">
+              <div className="flex items-center gap-2 rounded-lg bg-emerald-500/10 p-4 ring-1 ring-inset ring-emerald-500/20">
                 <CheckCircle className="h-5 w-5 text-emerald-500" />
                 <span className="text-sm text-emerald-700 dark:text-emerald-400">
                   {intl.formatMessage({ id: 'settings.update.upToDate' })}
@@ -966,7 +1143,7 @@ function UpdateTab() {
               <>
                 {/* Release notes */}
                 {updateInfo.release_notes && (
-                  <div className="rounded-lg border border-stone-200 p-4 dark:border-stone-700">
+                  <div className="rounded-lg p-4 ring-1 ring-inset ring-[var(--panel-border)]">
                     <h4 className="mb-2 text-sm font-medium text-stone-700 dark:text-stone-300">
                       {intl.formatMessage({ id: 'settings.update.releaseNotes' })}
                     </h4>
@@ -978,7 +1155,7 @@ function UpdateTab() {
 
                 {/* Homebrew hint */}
                 {isHomebrew && (
-                  <div className="rounded-lg border border-amber-200 bg-amber-50 p-4 dark:border-amber-800 dark:bg-amber-900/20">
+                  <div className="rounded-lg bg-amber-500/10 p-4 ring-1 ring-inset ring-amber-500/20">
                     <p className="text-sm text-amber-700 dark:text-amber-400">
                       {intl.formatMessage({ id: 'settings.update.brewHint' })}
                     </p>
@@ -990,7 +1167,7 @@ function UpdateTab() {
 
                 {/* No binary hint */}
                 {noBinary && !isHomebrew && (
-                  <div className="rounded-lg border border-amber-200 bg-amber-50 p-4 dark:border-amber-800 dark:bg-amber-900/20">
+                  <div className="rounded-lg bg-amber-500/10 p-4 ring-1 ring-inset ring-amber-500/20">
                     <p className="text-sm text-amber-700 dark:text-amber-400">
                       {intl.formatMessage({ id: 'settings.update.noBinary' })}
                     </p>
@@ -999,22 +1176,23 @@ function UpdateTab() {
 
                 {/* Install button */}
                 {!isHomebrew && !noBinary && (
-                  <button
+                  <Button
+                    variant="primary"
+                    icon={Download}
                     onClick={handleInstall}
                     disabled={installing}
-                    className="inline-flex w-full items-center justify-center gap-2 rounded-lg bg-amber-500 px-4 py-3 text-sm font-medium text-white transition-colors hover:bg-amber-600 disabled:opacity-50"
+                    className="w-full py-3"
                   >
-                    <Download className={cn('h-4 w-4', installing && 'animate-bounce')} />
                     {installing
                       ? intl.formatMessage({ id: 'settings.update.installing' })
                       : intl.formatMessage({ id: 'settings.update.install' })}
-                  </button>
+                  </Button>
                 )}
               </>
             )}
           </div>
         )}
-      </div>
+      </Card>
     </div>
   );
 }
@@ -1028,34 +1206,352 @@ function SettingRow({
   value: string;
   badge?: 'emerald' | 'amber' | 'rose';
 }) {
-  const badgeStyles: Record<string, string> = {
-    emerald:
-      'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400',
-    amber:
-      'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400',
-    rose: 'bg-rose-100 text-rose-700 dark:bg-rose-900/30 dark:text-rose-400',
-  };
+  const badgeTone = { emerald: 'success', amber: 'warning', rose: 'danger' } as const;
 
   return (
-    <div className="flex items-center justify-between border-b border-stone-100 pb-3 last:border-0 last:pb-0 dark:border-stone-800">
+    <div className="flex items-center justify-between border-b border-[var(--panel-border)] pb-3 last:border-0 last:pb-0">
       <span className="text-sm text-stone-600 dark:text-stone-400">
         {label}
       </span>
       {badge ? (
-        <span
-          className={cn(
-            'inline-flex rounded-full px-2.5 py-0.5 text-xs font-medium',
-            badgeStyles[badge]
-          )}
-        >
-          {value}
-        </span>
+        <Badge tone={badgeTone[badge]}>{value}</Badge>
       ) : (
         <span className="text-sm font-medium text-stone-900 dark:text-stone-50">
           {value}
         </span>
       )}
     </div>
+  );
+}
+
+// ── Privacy / Redaction Tab (RED) ──────────────────────────────
+
+const REDACTION_SOURCE_KEYS: ReadonlyArray<keyof RedactionSources> = [
+  'user_input',
+  'tool_results',
+  'system_prompt',
+  'sub_agent',
+  'cron_context',
+];
+const REDACTION_MODES: ReadonlyArray<RedactionSourceMode> = ['on', 'off', 'selective', 'inherit'];
+const REDACTION_RESTORE: ReadonlyArray<RedactionRestoreArgs> = ['restore', 'passthrough', 'deny'];
+
+function SkillSynthesisTab() {
+  const intl = useIntl();
+  const [config, setConfig] = useState<SkillSynthesisConfig | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const savedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => { if (savedTimerRef.current) clearTimeout(savedTimerRef.current); }, []);
+
+  const load = useCallback(async () => {
+    try {
+      setConfig(await api.skillSynthesis.get());
+    } catch (e) {
+      toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
+    }
+  }, [intl]);
+
+  useEffect(() => { load(); }, [load]);
+
+  const handleSave = async () => {
+    if (!config) return;
+    setSaving(true);
+    try {
+      await api.skillSynthesis.update({
+        auto_run: config.auto_run,
+        dry_run: config.dry_run,
+        interval_hours: config.interval_hours,
+        lookback_days: config.lookback_days,
+        target_agent: config.target_agent.trim(),
+      });
+      setSaved(true);
+      savedTimerRef.current = setTimeout(() => setSaved(false), 2000);
+    } catch (e) {
+      toast.error(intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: formatError(e) }));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (!config) {
+    return (
+      <Card>
+        <p className="py-8 text-center text-sm text-stone-400">{intl.formatMessage({ id: 'common.loading' })}</p>
+      </Card>
+    );
+  }
+
+  return (
+    <Card
+      bodyClassName="space-y-6"
+      title={
+        <span className="flex items-center gap-2">
+          <Sparkles className="h-4 w-4 text-amber-500" />
+          {intl.formatMessage({ id: 'settings.skillSynthesis' })}
+        </span>
+      }
+    >
+      <p className="text-xs text-stone-400 dark:text-stone-500">{intl.formatMessage({ id: 'skillSynthesis.desc' })}</p>
+
+      {/* Master toggle: auto_run */}
+      <label className="flex items-center justify-between gap-3 py-1.5">
+        <span>
+          <span className="block text-sm text-stone-700 dark:text-stone-300">{intl.formatMessage({ id: 'skillSynthesis.autoRun' })}</span>
+          <span className="block text-xs text-stone-400 dark:text-stone-500">{intl.formatMessage({ id: 'skillSynthesis.autoRun.hint' })}</span>
+        </span>
+        <input
+          type="checkbox"
+          checked={config.auto_run}
+          onChange={(e) => setConfig({ ...config, auto_run: e.target.checked })}
+          className="h-4 w-4 shrink-0 accent-amber-500"
+        />
+      </label>
+
+      {/* dry_run toggle */}
+      <label className="flex items-center justify-between gap-3 py-1.5">
+        <span>
+          <span className="block text-sm text-stone-700 dark:text-stone-300">{intl.formatMessage({ id: 'skillSynthesis.dryRun' })}</span>
+          <span className="block text-xs text-stone-400 dark:text-stone-500">{intl.formatMessage({ id: 'skillSynthesis.dryRun.hint' })}</span>
+        </span>
+        <input
+          type="checkbox"
+          checked={config.dry_run}
+          onChange={(e) => setConfig({ ...config, dry_run: e.target.checked })}
+          className="h-4 w-4 shrink-0 accent-amber-500"
+        />
+      </label>
+
+      {/* Live-mode warning when writes are enabled */}
+      {config.auto_run && !config.dry_run && (
+        <div className="flex items-start gap-2 rounded-lg border border-amber-300/60 bg-amber-50/60 px-3 py-2 text-xs text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-400">
+          <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+          <div className="space-y-1.5">
+            <p>{intl.formatMessage({ id: 'skillSynthesis.liveWarning' })}</p>
+            <p>
+              {intl.formatMessage({ id: 'skillSynthesis.apiKeyHelp' })}{' '}
+              <a
+                href="https://console.anthropic.com/settings/keys"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-0.5 font-medium underline underline-offset-2 hover:text-amber-800 dark:hover:text-amber-300"
+              >
+                {intl.formatMessage({ id: 'skillSynthesis.apiKeyLink' })}
+                <ExternalLink className="h-3 w-3" />
+              </a>
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* Scalars */}
+      <div className="grid gap-4 sm:grid-cols-2">
+        <FormField label={intl.formatMessage({ id: 'skillSynthesis.intervalHours' })} hint="1-168">
+          <input
+            type="number"
+            min={1}
+            max={168}
+            value={config.interval_hours}
+            onChange={(e) => setConfig({ ...config, interval_hours: Number(e.target.value) })}
+            className={inputClass}
+          />
+        </FormField>
+        <FormField label={intl.formatMessage({ id: 'skillSynthesis.lookbackDays' })} hint="1-30">
+          <input
+            type="number"
+            min={1}
+            max={30}
+            value={config.lookback_days}
+            onChange={(e) => setConfig({ ...config, lookback_days: Number(e.target.value) })}
+            className={inputClass}
+          />
+        </FormField>
+      </div>
+
+      <FormField label={intl.formatMessage({ id: 'skillSynthesis.targetAgent' })} hint={intl.formatMessage({ id: 'skillSynthesis.targetAgent.hint' })}>
+        <input
+          type="text"
+          value={config.target_agent}
+          onChange={(e) => setConfig({ ...config, target_agent: e.target.value })}
+          placeholder={intl.formatMessage({ id: 'skillSynthesis.targetAgent.placeholder' })}
+          className={inputClass}
+        />
+      </FormField>
+
+      <div className="flex items-center justify-end gap-3 border-t border-[var(--panel-border)] pt-4">
+        {saved && <span className="text-sm text-emerald-500">{intl.formatMessage({ id: 'settings.general.saved' })}</span>}
+        <button onClick={handleSave} disabled={saving} className={buttonPrimary}>
+          {saving ? intl.formatMessage({ id: 'common.saving' }) : intl.formatMessage({ id: 'common.save' })}
+        </button>
+      </div>
+    </Card>
+  );
+}
+
+function RedactionTab() {
+  const intl = useIntl();
+  const [config, setConfig] = useState<RedactionConfig | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [newTool, setNewTool] = useState('');
+  const savedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => { if (savedTimerRef.current) clearTimeout(savedTimerRef.current); }, []);
+
+  const load = useCallback(async () => {
+    try {
+      const res = await api.redaction.get();
+      setConfig(res);
+    } catch (e) {
+      toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
+    }
+  }, [intl]);
+
+  useEffect(() => { load(); }, [load]);
+
+  const handleSave = async () => {
+    if (!config) return;
+    setSaving(true);
+    try {
+      const payload: RedactionUpdate = {
+        enabled: config.enabled,
+        vault_ttl_hours: config.vault_ttl_hours,
+        purge_after_expire_days: config.purge_after_expire_days,
+        profiles: config.profiles,
+        sources: config.sources,
+        tool_egress: config.tool_egress,
+      };
+      await api.redaction.update(payload);
+      setSaved(true);
+      savedTimerRef.current = setTimeout(() => setSaved(false), 2000);
+    } catch (e) {
+      toast.error(intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: formatError(e) }));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const addEgress = () => {
+    const tool = newTool.trim();
+    if (!tool || !config || config.tool_egress[tool]) {
+      setNewTool('');
+      return;
+    }
+    setConfig({ ...config, tool_egress: { ...config.tool_egress, [tool]: { restore_args: 'deny', audit_reveal: false } } });
+    setNewTool('');
+  };
+
+  const removeEgress = (tool: string) => {
+    if (!config) return;
+    const next = { ...config.tool_egress };
+    delete next[tool];
+    setConfig({ ...config, tool_egress: next });
+  };
+
+  if (!config) {
+    return (
+      <Card>
+        <p className="py-8 text-center text-sm text-stone-400">{intl.formatMessage({ id: 'common.loading' })}</p>
+      </Card>
+    );
+  }
+
+  return (
+    <Card
+      bodyClassName="space-y-6"
+      title={
+        <span className="flex items-center gap-2">
+          <EyeOff className="h-4 w-4 text-amber-500" />
+          {intl.formatMessage({ id: 'settings.redaction' })}
+        </span>
+      }
+    >
+      <p className="text-xs text-stone-400 dark:text-stone-500">{intl.formatMessage({ id: 'redaction.desc' })}</p>
+
+      {/* Master toggle + scalars */}
+      <div className="space-y-4">
+        <label className="flex items-center justify-between py-1.5">
+          <span className="text-sm text-stone-700 dark:text-stone-300">{intl.formatMessage({ id: 'redaction.enabled' })}</span>
+          <input type="checkbox" checked={config.enabled} onChange={(e) => setConfig({ ...config, enabled: e.target.checked })} className="h-4 w-4 accent-amber-500" />
+        </label>
+        <div className="grid gap-4 sm:grid-cols-2">
+          <FormField label={intl.formatMessage({ id: 'redaction.vaultTtl' })} hint="1-8760">
+            <input type="number" min={1} max={8760} value={config.vault_ttl_hours} onChange={(e) => setConfig({ ...config, vault_ttl_hours: Number(e.target.value) })} className={inputClass} />
+          </FormField>
+          <FormField label={intl.formatMessage({ id: 'redaction.purgeAfter' })} hint="0-3650">
+            <input type="number" min={0} max={3650} value={config.purge_after_expire_days} onChange={(e) => setConfig({ ...config, purge_after_expire_days: Number(e.target.value) })} className={inputClass} />
+          </FormField>
+        </div>
+        <FormField label={intl.formatMessage({ id: 'redaction.profiles' })} hint={intl.formatMessage({ id: 'redaction.profiles.hint' })}>
+          <ChipEditor values={config.profiles} onChange={(v) => setConfig({ ...config, profiles: v })} placeholder="pii" addLabel={intl.formatMessage({ id: 'common.add' })} />
+        </FormField>
+      </div>
+
+      {/* Sources matrix */}
+      <div className="border-t border-[var(--panel-border)] pt-4">
+        <h4 className="mb-3 text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'redaction.sources' })}</h4>
+        <div className="space-y-3">
+          {REDACTION_SOURCE_KEYS.map((key) => (
+            <div key={key} className="flex items-center justify-between gap-3">
+              <span className="text-sm text-stone-700 dark:text-stone-300">{intl.formatMessage({ id: `redaction.source.${key}` })}</span>
+              <select
+                value={config.sources[key]}
+                onChange={(e) => setConfig({ ...config, sources: { ...config.sources, [key]: e.target.value as RedactionSourceMode } })}
+                className={cn(selectClass, 'w-40')}
+              >
+                {REDACTION_MODES.map((m) => (
+                  <option key={m} value={m}>{intl.formatMessage({ id: `redaction.mode.${m}` })}</option>
+                ))}
+              </select>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Tool egress rules */}
+      <div className="border-t border-[var(--panel-border)] pt-4">
+        <h4 className="mb-3 text-xs font-semibold uppercase text-stone-500 dark:text-stone-400">{intl.formatMessage({ id: 'redaction.toolEgress' })}</h4>
+        <p className="mb-3 text-xs text-stone-400 dark:text-stone-500">{intl.formatMessage({ id: 'redaction.toolEgress.hint' })}</p>
+        <div className="space-y-2">
+          {(Object.entries(config.tool_egress) as Array<[string, RedactionEgressRule]>).map(([tool, rule]) => (
+            <div key={tool} className="flex flex-wrap items-center gap-2 rounded-lg bg-stone-500/5 p-2.5 dark:bg-white/5">
+              <code className="rounded bg-stone-500/10 px-2 py-0.5 font-mono text-xs text-stone-700 dark:text-stone-300">{tool}</code>
+              <select
+                value={rule.restore_args}
+                onChange={(e) => setConfig({ ...config, tool_egress: { ...config.tool_egress, [tool]: { ...rule, restore_args: e.target.value as RedactionRestoreArgs } } })}
+                className={cn(selectClass, 'w-36')}
+              >
+                {REDACTION_RESTORE.map((r) => (
+                  <option key={r} value={r}>{intl.formatMessage({ id: `redaction.restore.${r}` })}</option>
+                ))}
+              </select>
+              <label className="flex items-center gap-1.5 text-xs text-stone-600 dark:text-stone-400">
+                <input type="checkbox" checked={rule.audit_reveal} onChange={(e) => setConfig({ ...config, tool_egress: { ...config.tool_egress, [tool]: { ...rule, audit_reveal: e.target.checked } } })} className="accent-amber-500" />
+                {intl.formatMessage({ id: 'redaction.auditReveal' })}
+              </label>
+              <button onClick={() => removeEgress(tool)} className="ml-auto rounded p-1 text-rose-500 hover:bg-rose-500/10">
+                <Trash2 className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          ))}
+          {Object.keys(config.tool_egress).length === 0 && (
+            <p className="text-xs text-stone-400">{intl.formatMessage({ id: 'common.noData' })}</p>
+          )}
+        </div>
+        <div className="mt-3 flex gap-2">
+          <input type="text" value={newTool} onChange={(e) => setNewTool(e.target.value)} placeholder={intl.formatMessage({ id: 'redaction.toolEgress.toolName' })} className={cn(inputClass, 'flex-1')} />
+          <Button variant="secondary" icon={Plus} onClick={addEgress}>
+            {intl.formatMessage({ id: 'redaction.toolEgress.add' })}
+          </Button>
+        </div>
+      </div>
+
+      <div className="flex items-center justify-end gap-2 pt-2">
+        {saved && <span className="text-xs text-emerald-600 dark:text-emerald-400">{intl.formatMessage({ id: 'settings.general.saved' })}</span>}
+        <Button variant="primary" onClick={handleSave} disabled={saving}>
+          {saving ? intl.formatMessage({ id: 'common.saving' }) : intl.formatMessage({ id: 'common.save' })}
+        </Button>
+      </div>
+    </Card>
   );
 }
 
@@ -1100,36 +1596,26 @@ function VoiceTab() {
   };
 
   return (
-    <div className="space-y-6 glass-card rounded-2xl p-6">
-      <h3 className="text-lg font-medium text-stone-900 dark:text-stone-50">
-        {intl.formatMessage({ id: 'voice.title' })}
-      </h3>
-
+    <Card title={intl.formatMessage({ id: 'voice.title' })} bodyClassName="space-y-6">
       <div className="grid gap-4 sm:grid-cols-2">
-        <div className="space-y-1.5">
-          <label className="block text-sm font-medium text-stone-700 dark:text-stone-300">
-            {intl.formatMessage({ id: 'voice.asrProvider' })}
-          </label>
+        <Field label={intl.formatMessage({ id: 'voice.asrProvider' })}>
           <select
             value={config.asr_provider}
             onChange={(e) => setConfig({ ...config, asr_provider: e.target.value })}
-            className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm dark:border-stone-600 dark:bg-stone-800 dark:text-stone-50"
+            className={controlClass}
           >
             <option value="auto">Auto</option>
             <option value="whisper-api">{intl.formatMessage({ id: 'voice.provider.whisperApi' })}</option>
             <option value="whisper-local">Whisper Local</option>
             <option value="sensevoice">{intl.formatMessage({ id: 'voice.provider.sensevoice' })}</option>
           </select>
-        </div>
+        </Field>
 
-        <div className="space-y-1.5">
-          <label className="block text-sm font-medium text-stone-700 dark:text-stone-300">
-            {intl.formatMessage({ id: 'voice.ttsProvider' })}
-          </label>
+        <Field label={intl.formatMessage({ id: 'voice.ttsProvider' })}>
           <select
             value={config.tts_provider}
             onChange={(e) => setConfig({ ...config, tts_provider: e.target.value })}
-            className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm dark:border-stone-600 dark:bg-stone-800 dark:text-stone-50"
+            className={controlClass}
           >
             <option value="auto">Auto</option>
             <option value="edge-tts">{intl.formatMessage({ id: 'voice.provider.edgeTts' })}</option>
@@ -1137,23 +1623,20 @@ function VoiceTab() {
             <option value="openai-tts">{intl.formatMessage({ id: 'voice.provider.openaiTts' })}</option>
             <option value="piper">{intl.formatMessage({ id: 'voice.provider.piper' })}</option>
           </select>
-        </div>
+        </Field>
 
-        <div className="space-y-1.5">
-          <label className="block text-sm font-medium text-stone-700 dark:text-stone-300">
-            {intl.formatMessage({ id: 'voice.language' })}
-          </label>
+        <Field label={intl.formatMessage({ id: 'voice.language' })}>
           <select
             value={config.asr_language}
             onChange={(e) => setConfig({ ...config, asr_language: e.target.value })}
-            className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm dark:border-stone-600 dark:bg-stone-800 dark:text-stone-50"
+            className={controlClass}
           >
             <option value="zh">中文 (zh)</option>
             <option value="en">English (en)</option>
             <option value="ja">日本語 (ja)</option>
             <option value="ko">한국어 (ko)</option>
           </select>
-        </div>
+        </Field>
 
         <div className="flex items-center gap-3 pt-6">
           <label className="relative inline-flex cursor-pointer items-center">
@@ -1172,19 +1655,15 @@ function VoiceTab() {
       </div>
 
       <div className="flex justify-end pt-2">
-        <button
-          onClick={handleSave}
-          disabled={saving}
-          className="inline-flex items-center gap-2 rounded-lg bg-amber-500 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-amber-600 disabled:opacity-50"
-        >
+        <Button variant="primary" onClick={handleSave} disabled={saving}>
           {saved
             ? intl.formatMessage({ id: 'settings.general.saved' })
             : saving
               ? intl.formatMessage({ id: 'common.saving' })
               : intl.formatMessage({ id: 'common.save' })}
-        </button>
+        </Button>
       </div>
-    </div>
+    </Card>
   );
 }
 
@@ -1248,23 +1727,22 @@ function ProactiveTab() {
   };
 
   return (
-    <div className="space-y-6 glass-card rounded-2xl p-6">
-      <div className="flex items-center justify-between">
-        <h3 className="text-lg font-medium text-stone-900 dark:text-stone-50">
-          {intl.formatMessage({ id: 'proactive.title' })}
-        </h3>
+    <Card
+      bodyClassName="space-y-6"
+      title={intl.formatMessage({ id: 'proactive.title' })}
+      actions={
         <select
           value={selectedAgent}
           onChange={(e) => setSelectedAgent(e.target.value)}
-          className="rounded-lg border border-stone-300 bg-white px-3 py-1.5 text-sm dark:border-stone-600 dark:bg-stone-800 dark:text-stone-50"
+          className={cn(controlClass, 'h-8 w-auto min-w-[8rem] text-xs')}
         >
           {agents.length === 0 && <option value="">{intl.formatMessage({ id: 'common.noData' })}</option>}
           {agents.map((a) => (
             <option key={a.name} value={a.name}>{a.display_name || a.name}</option>
           ))}
         </select>
-      </div>
-
+      }
+    >
       <div className="grid gap-4 sm:grid-cols-2">
         <div className="flex items-center gap-3">
           <label className="relative inline-flex cursor-pointer items-center">
@@ -1281,83 +1759,66 @@ function ProactiveTab() {
           </span>
         </div>
 
-        <div className="space-y-1.5">
-          <label className="block text-sm font-medium text-stone-700 dark:text-stone-300">
-            {intl.formatMessage({ id: 'proactive.checkInterval' })}
-          </label>
+        <Field
+          label={intl.formatMessage({ id: 'proactive.checkInterval' })}
+          help={intl.formatMessage({ id: 'proactive.checkInterval.hint' })}
+        >
           <input
             type="text"
             value={config.check_interval}
             onChange={(e) => setConfig({ ...config, check_interval: e.target.value })}
             placeholder="*/30 * * * *"
-            className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm dark:border-stone-600 dark:bg-stone-800 dark:text-stone-50"
+            className={controlClass}
           />
-          <p className="text-xs text-stone-400">{intl.formatMessage({ id: 'proactive.checkInterval.hint' })}</p>
-        </div>
+        </Field>
 
-        <div className="space-y-1.5">
-          <label className="block text-sm font-medium text-stone-700 dark:text-stone-300">
-            {intl.formatMessage({ id: 'proactive.quietHours' })}
-          </label>
+        <Field label={intl.formatMessage({ id: 'proactive.quietHours' })}>
           <div className="flex items-center gap-2">
             <input type="number" min={0} max={23} value={config.quiet_hours_start}
               onChange={(e) => setConfig({ ...config, quiet_hours_start: +e.target.value })}
-              className="w-16 rounded-lg border border-stone-300 bg-white px-2 py-2 text-sm text-center dark:border-stone-600 dark:bg-stone-800 dark:text-stone-50" />
+              className={cn(controlClass, 'w-16 px-2 text-center')} />
             <span className="text-stone-400">—</span>
             <input type="number" min={0} max={23} value={config.quiet_hours_end}
               onChange={(e) => setConfig({ ...config, quiet_hours_end: +e.target.value })}
-              className="w-16 rounded-lg border border-stone-300 bg-white px-2 py-2 text-sm text-center dark:border-stone-600 dark:bg-stone-800 dark:text-stone-50" />
+              className={cn(controlClass, 'w-16 px-2 text-center')} />
           </div>
-        </div>
+        </Field>
 
-        <div className="space-y-1.5">
-          <label className="block text-sm font-medium text-stone-700 dark:text-stone-300">
-            {intl.formatMessage({ id: 'proactive.maxMessagesPerHour' })}
-          </label>
+        <Field label={intl.formatMessage({ id: 'proactive.maxMessagesPerHour' })}>
           <input type="number" min={1} max={60} value={config.max_messages_per_hour}
             onChange={(e) => setConfig({ ...config, max_messages_per_hour: +e.target.value })}
-            className="w-24 rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm dark:border-stone-600 dark:bg-stone-800 dark:text-stone-50" />
-        </div>
+            className={cn(controlClass, 'w-24')} />
+        </Field>
 
-        <div className="space-y-1.5">
-          <label className="block text-sm font-medium text-stone-700 dark:text-stone-300">
-            {intl.formatMessage({ id: 'proactive.notifyChannel' })}
-          </label>
+        <Field label={intl.formatMessage({ id: 'proactive.notifyChannel' })}>
           <select value={config.notify_channel}
             onChange={(e) => setConfig({ ...config, notify_channel: e.target.value })}
-            className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm dark:border-stone-600 dark:bg-stone-800 dark:text-stone-50">
+            className={controlClass}>
             <option value="">{intl.formatMessage({ id: 'proactive.selectChannel' })}</option>
             <option value="telegram">Telegram</option>
             <option value="line">LINE</option>
             <option value="discord">Discord</option>
           </select>
-        </div>
+        </Field>
 
-        <div className="space-y-1.5">
-          <label className="block text-sm font-medium text-stone-700 dark:text-stone-300">
-            {intl.formatMessage({ id: 'proactive.chatId' })}
-          </label>
+        <Field label={intl.formatMessage({ id: 'proactive.chatId' })}>
           <input type="text" value={config.notify_chat_id}
             onChange={(e) => setConfig({ ...config, notify_chat_id: e.target.value })}
             placeholder="e.g., 123456789"
-            className="w-full rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm dark:border-stone-600 dark:bg-stone-800 dark:text-stone-50" />
-        </div>
+            className={controlClass} />
+        </Field>
       </div>
 
       <div className="flex justify-end pt-2">
-        <button
-          onClick={handleSave}
-          disabled={saving}
-          className="inline-flex items-center gap-2 rounded-lg bg-amber-500 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-amber-600 disabled:opacity-50"
-        >
+        <Button variant="primary" onClick={handleSave} disabled={saving}>
           {saved
             ? intl.formatMessage({ id: 'settings.general.saved' })
             : saving
               ? intl.formatMessage({ id: 'common.saving' })
               : intl.formatMessage({ id: 'common.save' })}
-        </button>
+        </Button>
       </div>
-    </div>
+    </Card>
   );
 }
 
@@ -1421,42 +1882,30 @@ function AutopilotTab() {
 
   return (
     <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <div>
-          <h3 className="text-lg font-medium text-stone-900 dark:text-stone-50">
-            {intl.formatMessage({ id: 'autopilot.title' })}
-          </h3>
-          <p className="mt-1 text-sm text-stone-500 dark:text-stone-400">
-            {intl.formatMessage({ id: 'autopilot.subtitle' })}
-          </p>
-        </div>
-        <button
-          onClick={() => setShowCreate(true)}
-          className="inline-flex items-center gap-2 rounded-lg bg-amber-500 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-amber-600"
-        >
-          <Plus className="h-4 w-4" />
-          {intl.formatMessage({ id: 'autopilot.create' })}
-        </button>
-      </div>
-
-      {loading ? (
-        <div className="py-12 text-center text-stone-400">
-          {intl.formatMessage({ id: 'common.loading' })}
-        </div>
-      ) : rules.length === 0 ? (
-        <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-stone-300 bg-white py-16 dark:border-stone-700 dark:bg-stone-900">
-          <Workflow className="mb-4 h-12 w-12 text-stone-300 dark:text-stone-600" />
-          <p className="text-stone-500 dark:text-stone-400">
-            {intl.formatMessage({ id: 'autopilot.empty' })}
-          </p>
-        </div>
-      ) : (
+      <Section
+        title={intl.formatMessage({ id: 'autopilot.title' })}
+        description={intl.formatMessage({ id: 'autopilot.subtitle' })}
+        actions={
+          <Button variant="primary" icon={Plus} onClick={() => setShowCreate(true)}>
+            {intl.formatMessage({ id: 'autopilot.create' })}
+          </Button>
+        }
+      >
+        {loading ? (
+          <div className="py-12 text-center text-stone-400">
+            {intl.formatMessage({ id: 'common.loading' })}
+          </div>
+        ) : rules.length === 0 ? (
+          <Card padded={false}>
+            <EmptyState
+              icon={Workflow}
+              title={intl.formatMessage({ id: 'autopilot.empty' })}
+            />
+          </Card>
+        ) : (
         <div className="space-y-3">
           {rules.map((rule) => (
-            <div
-              key={rule.id}
-              className="glass-card rounded-2xl p-5"
-            >
+            <Card key={rule.id} className="p-5" padded={false}>
               <div className="flex items-start justify-between">
                 <div className="flex items-center gap-3">
                   <button
@@ -1476,13 +1925,13 @@ function AutopilotTab() {
                   <div>
                     <h4 className="font-medium text-stone-900 dark:text-stone-50">{rule.name}</h4>
                     <div className="mt-1 flex items-center gap-2 text-xs text-stone-500 dark:text-stone-400">
-                      <span className="rounded-full bg-blue-100 px-2 py-0.5 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400">
+                      <Badge tone="info">
                         {intl.formatMessage({ id: `autopilot.trigger.${rule.trigger_event}` })}
-                      </span>
+                      </Badge>
                       <span>→</span>
-                      <span className="rounded-full bg-amber-100 px-2 py-0.5 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400">
+                      <Badge tone="accent">
                         {intl.formatMessage({ id: `autopilot.action.${rule.action.type}` })}
-                      </span>
+                      </Badge>
                       <span className="text-stone-400">({rule.action.agent_id})</span>
                     </div>
                   </div>
@@ -1490,14 +1939,14 @@ function AutopilotTab() {
                 <div className="flex items-center gap-2">
                   <button
                     onClick={() => handleViewHistory(rule.id)}
-                    className="rounded-lg p-1.5 text-stone-400 transition-colors hover:bg-stone-100 hover:text-stone-600 dark:hover:bg-stone-800 dark:hover:text-stone-300"
+                    className="rounded-lg p-1.5 text-stone-400 transition-colors hover:bg-stone-500/10 hover:text-stone-600 dark:hover:text-stone-300"
                     title={intl.formatMessage({ id: 'autopilot.history' })}
                   >
                     <Clock className="h-4 w-4" />
                   </button>
                   <button
                     onClick={() => setRemoveTarget({ id: rule.id, name: rule.name })}
-                    className="rounded-lg p-1.5 text-stone-400 transition-colors hover:bg-rose-50 hover:text-rose-500 dark:hover:bg-rose-900/20"
+                    className="rounded-lg p-1.5 text-stone-400 transition-colors hover:bg-rose-500/10 hover:text-rose-500"
                   >
                     <XCircle className="h-4 w-4" />
                   </button>
@@ -1512,10 +1961,11 @@ function AutopilotTab() {
                   </span>
                 )}
               </div>
-            </div>
+            </Card>
           ))}
         </div>
-      )}
+        )}
+      </Section>
 
       {/* Create Rule Dialog */}
       {showCreate && (

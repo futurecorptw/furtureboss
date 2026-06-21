@@ -26,10 +26,11 @@ members = [
     "crates/duduclaw-cli-runtime",
     "crates/duduclaw-cli-worker",
     "crates/duduclaw-license",
+    "crates/duduclaw-fork",
 ]
 
 [workspace.package]
-version = "1.20.0"
+version = "1.22.1"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["DuDuClaw Contributors"]
@@ -99,6 +100,7 @@ duduclaw-security = { path = "crates/duduclaw-security" }
 duduclaw-memory = { path = "crates/duduclaw-memory" }
 duduclaw-container = { path = "crates/duduclaw-container" }
 duduclaw-agent = { path = "crates/duduclaw-agent" }
+duduclaw-fork = { path = "crates/duduclaw-fork" }
 duduclaw-bridge = { path = "crates/duduclaw-bridge" }
 duduclaw-dashboard = { path = "crates/duduclaw-dashboard" }
 duduclaw-auth = { path = "crates/duduclaw-auth" }

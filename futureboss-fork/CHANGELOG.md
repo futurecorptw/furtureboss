@@ -1,6 +1,204 @@
 # Changelog
 
 
+## [1.22.1] - 2026-06-21 — Core gateway drops the Python runtime dependency
+
+### Changed
+- **Skill vetting is now Rust-native.** The dashboard `skills.vet` path no longer
+  shells out to `python3 -m duduclaw.evolution.run`; it uses
+  `skill_lifecycle::security_scanner::scan_skill` — the same scanner already
+  backing the MCP `skill_security_scan` tool and the sandbox-trial gate, so the
+  dashboard, agents, and lifecycle pipeline share one verdict.
+- **Channel delegate / fallback is now Rust-native.** The `channel_reply`
+  3rd-tier fallback and `agents.delegate` (wait=true) call
+  `direct_api::call_direct_api` (new `call_direct_api_delegate`) instead of the
+  `duduclaw.sdk.chat` Python subprocess.
+- **The core gateway/CLI installed via npm/Homebrew now has no Python runtime
+  dependency.** `pip install duduclaw` is optional — the `duduclaw` PyPI package
+  is a standalone importable library only. Advanced local inference
+  (MLX / LLMLingua-2) still depends on the separate `mlx_lm` / `llmlingua` ML
+  packages, not on `duduclaw`. Docs updated across README (zh/en/ja),
+  ARCHITECTURE, overview, evolution-engine, docker, and feature docs.
+
+### Removed
+- Deleted `gateway/src/evolution.rs` (its sole content was the Python vet
+  bridge), the dead `vet_skill_native` fallback (which used non-compliant
+  unanchored `contains`), and the `call_python_sdk_v2` / `find_python_path`
+  helpers in `channel_reply`.
+
+
+
+## [1.22.0] - 2026-06-21 — RFC-26 Live Forking · skill-synthesis scheduler · Calm Glass dashboard
+
+Inspired by [vstorm-co/pydantic-deepagents](https://github.com/vstorm-co/pydantic-deepagents),
+this adds **Live Run Forking** — split an in-flight agent task into N competing
+branches that explore different strategies in isolated copy-on-write workspaces,
+then let an AI judge pick the winner. **Default off**; per-agent opt-in via
+`agent.toml [fork] enabled = true`. See `docs/rfc/RFC-26-deep-agents-alignment.md` and
+`docs/todo/TODO-rfc26-live-forking.md`.
+
+### Added
+- **New crate `duduclaw-fork`** — the forking engine: `Branch`/`BranchState`,
+  copy-on-write `BranchOverlay` (reads fall through to parent, writes stay local,
+  `promote()` merges the winner), per-branch + aggregate `budget::Pool`,
+  `ForkController` over a decoupled `BranchExecutor` trait, a `JudgeAgent` with the
+  deep-agents confidence formula (`quality·0.4 + test_pass·0.4 + consistency·0.2`),
+  4 merge modes (`manual`/`auto`/`auto_with_fallback`/`vote`), and a `test_runner`
+  that scores branches by their configured test command. (49 unit tests.)
+- **6 MCP tools** gated by the new `Scope::ForkExecute` + the `[fork] enabled`
+  toggle: `fork_run`, `inspect_branches`, `diff_branches`, `merge_or_select`,
+  `terminate_branch`, `fork_cost` (`crates/duduclaw-cli/src/mcp_fork.rs`).
+- **`RotatingBranchExecutor`** — runs each branch through the `AccountRotator`
+  + a real `claude` spawner, enforcing per-branch and aggregate USD budgets; forks
+  execute in a **background** task so the MCP stdio loop never blocks. Branch
+  outcomes + spend recorded to `~/.duduclaw/fork_history.jsonl` (advisory-locked)
+  with in-process `FORK_METRICS` counters (`crates/duduclaw-cli/src/mcp_fork_exec.rs`).
+- **Checkpoint fork/rewind** (`duduclaw-durability`) — `fork(checkpoint_id, new_task)`
+  copies state under a new lineage, `rewind(task, checkpoint_id)` restores an earlier
+  snapshot, `Checkpoint.parent_checkpoint_id` tracks lineage; id-addressable archive.
+- **Smoke harness** `scripts/smoke-fork.{sh,ps1}`.
+
+### Added (round 2 — cross-process + parity follow-ups)
+- **Shared SQLite fork store** (`duduclaw-fork::ForkStore`, WAL at `~/.duduclaw/fork_store.db`) — the
+  cross-process source of truth. `mcp_fork`/`mcp_fork_exec` refactored onto it.
+- **Gateway `/metrics`** emits `duduclaw_fork_*` lines (read from the store at scrape time).
+- **Dashboard ForkPage** (`web/`) + `fork.list/inspect/resolve` WebSocket RPC — list forks, compare
+  branches side by side, see the judge's winner, resolve manually. New `/forks` route + nav.
+- **`memory_improve`** MCP tool — clusters memories by tag into a propose-not-apply reflection scaffold.
+- **`plan_start`** MCP tool (Plan Mode) — clarify-first planning scaffold, `agent.toml [planner]` toggle.
+- **Built-in skills** — `code-review`/`refactor`/`test-writer`/`git-workflow` seeded idempotently into
+  every new agent's `SKILLS/` at creation.
+- **Checkpoint durability** — `CheckpointManager::with_persistence` SQLite backend; fork/rewind/lineage
+  survive restart. **Task Board** — `claim_task` (atomic CAS) + parent-cycle detection.
+- **Fork executor hardening** — branches capped to distinct available accounts (logged); pre-spawn
+  cancellation registry for `terminate_branch`.
+
+### Added (round 3 — the last deferred items)
+- **Native copy-on-write overlay** — `BranchOverlay` clones the parent workspace via `clonefile(2)`
+  (`cp -c`, macOS/APFS) or `cp --reflink` (Linux btrfs/XFS); `detect_backend()` probes once and falls
+  back to the snapshot copy if unavailable.
+- **Streaming budget enforcement + external SIGKILL** — `ClaudeCliSpawner` streams stream-json, charges
+  `total_cost_usd` incrementally, and kills the child mid-stream on per-branch overspend
+  (`SpawnOutcome::BudgetExceeded`); a per-branch kill-switch registry lets `terminate_branch` SIGKILL an
+  in-flight subprocess (`→ Terminated`).
+- **Activity-Feed mirroring** — fork resolutions write a `fork_resolved` row into the gateway's
+  cross-process `activity` table (`<home>/tasks.db`), surfacing on the dashboard Activity Feed.
+
+### Added (round 4 — cross-branch aggregate pre-emption)
+- **`duduclaw_fork::LiveAggregate`** — a streaming-time companion to `budget::Pool`, shared across a
+  fork's concurrent branches. It tracks every in-flight branch's live `total_cost_usd`; the moment their
+  combined spend crosses the aggregate cap it names the **most-expensive in-flight branch** (deterministic
+  tie-break) so it can be pre-emptively killed — instead of waiting for each branch to hit its own
+  per-branch cap. (5 unit tests.)
+- **Spawner wiring** (`mcp_fork_exec.rs`) — each stream-json cost update runs the pure
+  `stream_budget_decision` (per-branch cap → aggregate `observe`): the priciest over-budget branch
+  self-kills if it is the observer, otherwise the observer `request_budget_kill`s the sibling. The
+  aggregate kill is tagged so the woken branch maps to `BudgetExceeded` (→ `BudgetKilled`), distinct
+  from an operator `terminate_branch` (`Cancelled` → `Terminated`); `LiveAggregate::finish` frees a
+  branch's budget for survivors once it ends. (5 unit tests.) Completes RFC-26 §4.2.
+
+### Added (skill synthesis — W19-P1)
+- **Periodic auto-run scheduler** (`skill_synthesis_pipeline::scheduler`) — runs the
+  rollout-to-skill pipeline on a fixed interval instead of waiting for a manual
+  `skill_synthesis_run` MCP call. **Off by default**, **dry-run by default even when
+  enabled**, hot-reloaded config (`config.toml [skill_synthesis] auto_run/dry_run/
+  interval_hours/lookback_days/target_agent`), and non-blocking (pipeline errors are
+  captured into the run summary, never abort the loop).
+- **Dashboard config RPCs** — admin-gated `skill_synthesis.get` / `skill_synthesis.update`
+  (validated writes onto `config.toml [skill_synthesis]`); `skill_synthesis_threshold`
+  is a `u32` count (no longer a float — fixes registry scan rejecting `0.7`).
+- **`fetch_episodic_evidence`** with path-traversal rejection + tests.
+
+### Added (dashboard — Calm Glass redesign)
+- **Calm Glass design system** — shared component library (`web/src/components/ui/`:
+  Page / PageHeader / Section / Card / StatCard / Button / Badge / Field / Tabs /
+  EmptyState) + a 6-group sidebar nav model (`layout/nav-model.ts`), applied across
+  every dashboard page. Design spec in `web/DESIGN.md`; design tokens in `index.css`.
+- i18n keys synchronized across `en` / `ja-JP` / `zh-TW`.
+
+### Documentation
+- **Feature docs reorg + trilingual coverage** — 10 new feature deep-dives (20–29:
+  memory-intelligence, governance-layer, durability-framework, autopilot-engine,
+  task-board, identity-resolution, mcp-http-sse, pty-pool-runtime, live-forking,
+  evolution-events) in `en` / `ja-JP` / `zh-TW`; back-translated 16–19 to `ja-JP` /
+  `zh-TW`; `feature-inventory` refreshed `v1.8.14 → v1.22.0`; README indexes updated.
+
+### Housekeeping
+- Removed residual local artifacts (test `.profraw`/coverage, stale 5.6 GB git
+  worktrees) — gitignored cruft only, no repo content affected.
+
+
+## [1.21.1] - 2026-06-18 — Channel routing: stop bot "identity mixing"
+
+### Fixed
+- **Agent-bound bot token now takes precedence over the global poller**
+  (Telegram / Slack / Discord). These channels' long-poll (`getUpdates`) and
+  gateway sessions are exclusive per bot token. When the same token was
+  configured both globally (`config.toml`) and on a specific agent, the dedup
+  kept the generic **global** poller and skipped the agent one — so two pollers
+  fought over the same token (Telegram **409 Conflict**, dropped messages) and
+  the surviving generic poller routed via `default_agent`, causing **identity
+  mixing** (e.g. a CEO bot sometimes answered as COO). Precedence is reversed:
+  agent tokens are collected first and the global poller is skipped (with a
+  `WARN` naming the owner) for any token an agent already binds. Extracted the
+  shared `find_global_token_owner` helper with unit tests.
+- **`default_agent` validation at startup** — a dangling `default_agent`
+  (pointing at a renamed/removed agent) silently fell back to an arbitrary main
+  agent at routing time, the other root cause of identity mixing. The gateway
+  now validates `default_agent` against the loaded registry at boot and `WARN`s
+  loudly (listing available agents), and the per-turn fallback path warns too.
+
+
+
+## [1.21.0] - 2026-06-17 — RFC-25 §5 Followups: non-Claude path fully functional
+
+RFC-25 v1.20.0 compiled the multi-runtime abstraction but left the non-Claude
+(Codex / Gemini / OpenAI-compat) path as a thin opt-in with documented gaps.
+v1.21.0 closes all 11 of those gaps so non-Claude agents are first-class, and
+hardens the release tooling so PyPI can no longer be silently skipped.
+
+### Added
+- **Multi-turn context for non-Claude runtimes** (A1): `conversation_history`
+  threaded through the choke-point and consumed by Codex / Gemini / OpenAI-compat
+  (OpenAI-compat uses native multi-turn `messages`); duplicate `ConversationTurn`
+  consolidated onto `runtime::ConversationTurn`.
+- **Non-Claude cost telemetry** (A3): `run_agent_prompt` records token usage to
+  `CostTelemetry` (detached, classified by `request_type`) so Codex/Gemini/OpenAI
+  usage is visible to cost summaries, the 200K price-cliff warning, and adaptive routing.
+- **Non-Claude channel keepalive** (A4): periodic `ProgressEvent::Keepalive` during
+  long non-Claude replies so channels don't look stalled / hit idle timeouts.
+- **`scripts/release.sh` multi-platform sync**: `audit` (per-platform version + drift),
+  synchronized bump across every manifest, a post-bump assertion that aborts if any
+  platform is left behind, and `verify <version>` that queries PyPI + npm.
+
+### Changed
+- **Pending-tasks for non-Claude delegation** (A2): the Task-Board queue is inlined
+  into the non-Claude sub-agent system prompt.
+- **Routing decision centralized** (B1): `RuntimeSettings::non_claude_provider()`;
+  "Claude into the registry" is an explicit non-goal (orphan `runtime/claude.rs`).
+- **Single `agent.toml` parse per reply** (B2): `RuntimeSettings` + `load_runtime_settings`
+  threaded via `AgentPrompt.runtime_settings` (3 → 1 reads/reply).
+- **Per-(home,provider) failover health** (R1): choke-point routes through
+  `FailoverManager` (3 failures → 60s cooldown → fallback), keyed per home to avoid
+  cross-tenant bleed.
+- **Per-home `RuntimeRegistry` cache** (R2): replaces the first-home-binding `OnceCell`.
+- **A2A target resolution** (R3): `resolve_target_agent` (default → Main agent, else
+  validated) + per-home `AgentRegistry` cache with agents-dir mtime invalidation.
+- **Utility provider routing** (N2): summarizer / wiki-ingest / reflection / synthesis
+  honour the agent's (or global `config.toml [runtime] utility_provider`) runtime.
+- `DEFAULT_UTILITY_MODEL` is a single source in `duduclaw-core` (B3).
+
+### Fixed
+- **PyPI release miss**: `pyproject.toml` had drifted to 1.18.0 (while Cargo/READMEs
+  were at 1.20.0), so the CI `pypi-publish` job built a stale wheel that
+  `skip-existing` silently dropped. `release.sh` now syncs every manifest and
+  asserts they all reach the new version; this release also heals the drift
+  (pyproject + npm manifests → 1.21.0).
+- `record_usage` no longer blocks the reply on a synchronous SQLite write, and skips
+  empty-`agent_id` (agent-less utility) attribution.
+
+
+
 ## [1.20.0] - 2026-06-16 — RFC-25 Multi-Runtime Unlock + A2A
 
 The "Multi-Runtime four-backend" abstraction was previously **orphan, uncompiled

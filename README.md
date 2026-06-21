@@ -1,6 +1,6 @@
 # FutureBoss
 
-**Version 1.4.0**
+**Version 2.0.0**
 
 FutureBoss 是一套「單人專屬」的 AI Agent 控制台 —— 你的 AI 數位分身。提供精簡、溫暖的儀表板介面，整合 Telegram 等通道、排程提醒、記憶與知識庫，讓 AI 助理像貼身特助一樣為你工作。
 
@@ -79,6 +79,12 @@ cargo build --release -p duduclaw-cli --bin duduclaw
 ---
 
 ## 更新紀錄
+
+### v2.0.0
+- **大型升級：底層 fork 從上游 DuDuClaw v1.20.0 rebase 到 v1.22.1**，併入上游近期所有功能。
+- **前端設計系統全面換新（Calm Glass）**：重構儀表板視覺與導覽（選單改為分組、可折疊），並保留 FutureBoss 品牌、精簡選單與「AI 首席特助 / 排程」客製頁。
+- 併入上游新功能：並行分支探索（live forking）、技能自動合成排程、WebChat 檔案上傳與多模態、治理 / 推論 / MCP 金鑰等新頁面；通道修正「agent 綁定的 bot token 優先於全域」。
+- 保留所有 FutureBoss 客製：Telegram typing + 去 Markdown、Google OAuth 環境變數預設、排程時區欄位、品牌與貓圖。
 
 ### v1.4.0
 - **合併為單一 app**：移除獨立的反向代理層（`futureboss-skin/`），客製外觀（skin / 品牌 / 預設淺色 / 貓圖）直接內建於前端；後端以 `rust-embed` 把儀表板編進 gateway，建置後直接跑 gateway 即可，不再需要 proxy 或選擇模式。

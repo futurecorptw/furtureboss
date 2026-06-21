@@ -30,9 +30,68 @@ observability. Same architecture standards as DuDuClaw.
 [![Rust](https://img.shields.io/badge/Rust-2024_edition-orange?logo=rust)](https://www.rust-lang.org/)
 [![Python](https://img.shields.io/badge/Python-3.9+-blue?logo=python)](https://www.python.org/)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.20.0-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
+[![Version](https://img.shields.io/badge/version-1.22.1-blue)](https://github.com/zhixuli0406/DuDuClaw/releases)
 [![npm](https://img.shields.io/npm/v/duduclaw?logo=npm)](https://www.npmjs.com/package/duduclaw)
 [![PyPI](https://img.shields.io/pypi/v/duduclaw?logo=pypi)](https://pypi.org/project/duduclaw/)
+
+---
+
+## 🔒 信任與安全（Trust & Security）
+
+這是開源專案 — 完整透明地說明你安裝的是什麼。
+
+### 為什麼一個「新」的 npm 套件版本號已經 1.21+？
+
+DuDuClaw 在公開之前，已在私有 repository 經歷數個月密集開發（400+ commits）。
+完整歷史見 [git log](https://github.com/zhixuli0406/DuDuClaw/commits/main)。
+
+### npm 套件裡有什麼？
+
+- 一個小型 JS wrapper，僅負責呼叫對應平台的 Rust 二進位
+- 平台二進位透過 npm `optionalDependencies`（`@duduclaw/<platform>`）安裝 —
+  **沒有 postinstall 從任意 URL 下載並執行外部程式碼**
+- `postinstall` 只檢查平台套件是否就位（見 [`npm/duduclaw/scripts/install.js`](npm/duduclaw/scripts/install.js)），不下載、不執行任何東西
+- GitHub Releases 的二進位皆附 SHA-256 checksum
+
+### 不信任預編譯二進位？從原始碼建置
+
+```bash
+git clone https://github.com/zhixuli0406/DuDuClaw
+cd DuDuClaw
+cargo build --release
+```
+
+### 二進位驗證
+
+每個 Release 都附帶 SHA-256 checksum，並透過 [cosign](https://github.com/sigstore/cosign) keyless 簽章：
+
+```bash
+# 從 Releases 下載
+wget https://github.com/zhixuli0406/DuDuClaw/releases/download/v1.21.1/duduclaw-darwin-arm64.tar.gz
+
+# 驗證 SHA-256（對照 release 內的 .sha256 檔）
+shasum -a 256 -c duduclaw-darwin-arm64.tar.gz.sha256
+
+# 驗證 cosign 簽章
+cosign verify-blob \
+  --certificate duduclaw-darwin-arm64.tar.gz.pem \
+  --signature duduclaw-darwin-arm64.tar.gz.sig \
+  --certificate-identity-regexp "https://github.com/zhixuli0406/DuDuClaw" \
+  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+  duduclaw-darwin-arm64.tar.gz
+```
+
+### 供應鏈透明度
+
+- **授權**：Apache 2.0
+- **維護者**：嘟嘟數位科技有限公司（台灣登記公司，統編 94139082）
+- **公開 commit 歷史**：github.com/zhixuli0406/DuDuClaw
+- **CI/CD**：所有 Release 皆由 GitHub Actions 建置
+- **無遙測（No telemetry）**：零 phone-home 連線
+- **不蒐集 API 金鑰**：所有密鑰以 AES-256-GCM 留在你自己的機器上
+- **不需特權提升**：完全在 user space 執行
+
+漏洞回報請見 [SECURITY.md](SECURITY.md)。
 
 ---
 
@@ -55,19 +114,23 @@ observability. Same architecture standards as DuDuClaw.
 
 ---
 
-> 🎉 **v1.18.0 — Dashboard 預算／用量正確化 + 可靠度修補**（[Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.18.0)）
+> 🎉 **v1.22.0 — RFC-26 即時分支決戰正式發佈 · Skill 合成排程器 · Calm Glass dashboard**（[Release](https://github.com/zhixuli0406/DuDuClaw/releases/tag/v1.22.0)）
 >
-> Dashboard 的預算與用量改讀持久化的 `CostTelemetry` 帳本，不再讀那個一重建就歸零的記憶體計數，外加一輪 dashboard runtime bug 清掃。
+> 三條主線：**RFC-26 Live Forking** 完成 round 1–4——把進行中的任務分叉成 N 個並行競爭分支、各自在 copy-on-write 隔離工作區嘗試不同策略，由 AI judge 挑出勝者；**Skill 合成排程器**（W19-P1）讓「對話 → skill」萃取自主週期執行；**Calm Glass dashboard** 以共用元件庫重構全頁面。三者皆預設關閉、可漸進啟用。
 >
-> - **預算／用量顯示真實數字** — 原本所有預算顯示都讀 `AccountRotator.spent_this_month`，但這個記憶體計數每 5 分鐘 rotator 重建就歸零、gateway 重啟也歸零、OAuth 訂閱帳號每次呼叫成本又是 0，而且每個 agent 都顯示「全帳號加總」同一個數字。改為從 `CostTelemetry`（持久 SQLite 帳本）讀本月至今用量：`agents.list` / `agents.inspect` 顯示**各 agent 自己的**月度用量，`accounts.budget_summary` 顯示真實全域總額
-> - **成本單位修正** — `cost_millicents` 欄位名是誤稱，實際存的就是整數 cents（用定價反推驗證：某筆 309 = $3.09）。移除 analytics 成本／節省顯示裡多餘的 `/10`（原本少報 10 倍）
-> - **`marketplace.install` 補實作** — 原本是回錯誤的 stub，改為把 catalog MCP server 安裝進指定 agent 的 `.mcp.json`，前端加上目標 agent 選擇對話框
-> - **設定持久化補洞** — `system.version` 回傳 `edition` 供 dashboard 判斷 Pro-only UI；`system.update_config` 把 `[voice]` 寫進 `inference.toml`、per-agent `[proactive]` 經 `agents.update` 存進 `agent.toml` 並由 `agents.inspect` 回填
-> - **前端修補** — 排程新增送出必要的 `name`+`task`（原本失敗）、MCP servers 以後端序列化的陣列形狀消費、新增 theme store + 語言切換接進 Header、補 88 個跨 `zh-TW` / `en` / `ja-JP` 的 i18n key、預算進度條除零防護、帳號靜默錯誤改以 toast 呈現
+> - **Live Forking** — `duduclaw-fork` 引擎 + 6 個 MCP 工具 + 跨程序 SQLite `ForkStore` + `RotatingBranchExecutor`（每分支獨立帳號）+ `LiveAggregate` 跨分支聚合預算搶占（殺最貴的 in-flight 分支）+ native copy-on-write overlay（`clonefile` / `--reflink`）。預設關閉，`agent.toml [fork] enabled = true` 啟用
+> - **Skill 合成排程器** — `config.toml [skill_synthesis] auto_run/dry_run/interval_hours/lookback_days`，dashboard `skill_synthesis.get/update` RPC；`skill_synthesis_threshold` 改回 `u32`（修好 registry 掃描拒絕 `0.7` 的型別錯誤）
+> - **Calm Glass** — `web/src/components/ui/` 共用元件庫 + `nav-model.ts` 六分組側邊欄 + `web/DESIGN.md` 設計規範，三語 i18n 同步
+> - **文件** — 新增 10 篇功能深入文件（20–29）× en/ja/zh、補譯 16–19、`feature-inventory` 更新至 v1.22.0
 
 <details>
-<summary><strong>v1.9.4 → v1.17.x 累積亮點</strong></summary>
+<summary><strong>v1.9.4 → v1.20.x 累積亮點</strong></summary>
 
+- **v1.21.0** — RFC-25 §5 收尾：非 Claude（Codex / Gemini / OpenAI-compat）路徑補齊全部 11 項缺口成為一等公民（多輪上下文、成本遙測、keepalive、per-(home,provider) failover 退避）；`release.sh` 多平台版本同步 + 漂移偵測 + bump 後 assert + `verify` 查 registry，修好 PyPI 被 `skip-existing` 靜默凍版的問題
+- **v1.20.0** — RFC-25 多模型解鎖 + A2A：「Multi-Runtime 四後端」過去是未編譯的孤兒程式碼，每條執行路徑都寫死 Claude。v1.20.0 把它接上電，所有呼叫 LLM 的子系統走單一 provider-agnostic choke-point（`runtime_dispatch::run_agent_prompt` + lazy 自動偵測的 `RuntimeRegistry`）；channel reply / GVU / 子 agent 派工在非 Claude provider 時走 choke-point（Claude 維持 OAuth 輪替 / PTY 路徑，零回歸）；ACP `tasks/send` 改為實際執行目標 agent 並正確回報 Failed / Completed；Phase 0 拆掉 GVU 演化模型硬鎖（reject → warn）
+
+- **v1.19.0** — Memory Intelligence：把 W18/W19 設計但未實作的記憶層非侵入式落地於現行 Rust `SqliteMemoryEngine`。**Temporal Memory**（`memories` 加時態 / 知識圖譜欄位 + `store_temporal` 自動取代鏈 + `get_history`/`get_at`，搜尋預設只回有效記憶）；**Reflexion Loop**（橋接既有 `MistakeNotebook`：召回注入答題 prompt + 同 category ≥3 固化成 semantic 規則）；**`memory_fetch_batch`** MCP 工具（依 ID 批次讀取 ≤100，namespace/ownership 隔離）。`MemoryEntry` 不動，零破壞
+- **v1.18.0** — Dashboard 預算／用量正確化：改讀持久化 `CostTelemetry` 帳本（取代一重建就歸零的記憶體計數），修 `cost_millicents` 單位誤稱、`marketplace.install` 補實作、設定持久化補洞、前端一輪 runtime bug 清掃 + 88 個 i18n key
 - **v1.17.0** — RFC-24 License v2.0（Open Core 基礎）：新 crate `duduclaw-license`（verification-only 客戶端，簽章金鑰留在 `commercial/duduclaw-license`），7 個 tier 繼承鏈 `OpenSource` / `Hobby` / `Solo` / `Studio` / `Business` / `SelfHostPro` / `Oem`，Ed25519 trust registry 由 `DUDUCLAW_LICENSE_PUBKEY_<ID>` env 種子化（空 registry fail-safe 退回 OpenSource）。Apache 2.0 核心**無限制可用**，付費訂閱解鎖 `commercial/*` 加值模組
 - **v1.16.0** — MCP Refresh Tokens + GVU `SoulPatchOp::Consolidate`：新模組 `mcp_refresh` 以 `~/.duduclaw/mcp_tokens.db` 後盾的長壽憑證（`ddc_refresh_<env>_<64hex>`、90 天、可撤銷、僅儲 hash），解決 Claude Desktop auth-fail 後靜默斷線不重試；GVU 新增 `SoulPatchOp::Consolidate` 變體帶「縮減不變式」，讓 SOUL.md 接近 150 行／8KB 硬上限時可自我觸發整合
 - **v1.15.2** — `agent_update_soul` 信賴後門封補：原本寫 SOUL.md 後沒呼叫 `soul_guard::accept_soul_change` 更新完整性 hash，每次合法呼叫都會留下永久 stored-vs-current drift；且整條呼叫鏈不寫 `tool_calls.jsonl`，後門對事後分析完全隱形。v1.15.2 補齊 audit row（成功 + 四種拒絕路徑都記，hash 前綴 16 字元）並在每次寫入後同步 fingerprint
@@ -394,13 +457,16 @@ DuDuClaw 在 Claude Code 的 Hook 系統上建構了三層漸進式防禦：
 
 ## 安裝
 
-### npm（推薦）
+### npm（推薦，所有平台含 Windows）
 
 ```bash
 npm install -g duduclaw
 ```
 
-安裝完成後會自動下載對應平台的預編譯 binary（支援 macOS ARM64/x64、Linux x64/ARM64、Windows x64）。
+安裝完成後會自動下載對應平台的**預編譯 binary**（支援 macOS ARM64/x64、Linux x64/ARM64、Windows x64），**無需編譯器、無需 Rust、無需 MSVC Build Tools**。Windows 使用者只要先裝 [Node.js](https://nodejs.org/) 即可，這是唯一前置需求。
+
+> **⚠️ 如果安裝過程要求你安裝 Rust / MSVC Build Tools（~2GB）並編譯（約 1.5 小時），代表你走錯路徑了。**
+> 那是「[從原始碼建構](#從原始碼建構)」路徑，只有想改程式碼的貢獻者才需要。一般使用請務必用上面的 `npm install -g duduclaw`（或下方 Homebrew / 一行安裝），會直接下載官方預編譯 binary。
 
 ### Homebrew（macOS / Linux）
 
@@ -410,24 +476,67 @@ brew install zhixuli0406/tap/duduclaw
 
 ### 一行安裝
 
+**macOS / Linux：**
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/zhixuli0406/DuDuClaw/main/scripts/install.sh | sh
 ```
 
-### Python SDK（必要依賴）
+**Windows（PowerShell）：**
 
-DuDuClaw 的進化引擎（Skill Vetter）與部分通道橋接需要 Python 環境：
+```powershell
+irm https://raw.githubusercontent.com/zhixuli0406/DuDuClaw/main/scripts/install.ps1 | iex
+```
+
+> 一行安裝腳本會自動偵測**最新 release** 並下載對應平台的預編譯 binary，同樣免編譯。若 GitHub 下載失敗才會詢問是否改用原始碼建構（此時建議改用 `npm install -g duduclaw`）。可用環境變數 `DUDUCLAW_VERSION` 釘選特定版本。
+
+### Python SDK（選用函式庫，非 CLI）
+
+> **重要**：核心 gateway / CLI（`duduclaw` 指令）是 **Rust 二進位**，透過 **npm** 或 **Homebrew** 安裝即可獲得**完整功能**——Skill 安全掃描與通道回覆全部由 Rust-native 路徑處理，**不再需要任何 Python 依賴**。
+> PyPI 上的 `duduclaw` 是一個**純 Python 函式庫**（供 `import duduclaw` 使用），**不含任何命令列工具**；因此 `pipx install duduclaw` 會失敗（No apps associated with package），這是預期行為。
+
+`pip install duduclaw` **對核心功能而言是選用的**，只在下列情境才需要：
+
+- 你想在自己的 Python 程式中 `import duduclaw`（agents / channels / mcp / memory_eval 模組）。
+- 你要跑獨立的記憶評測工具（LOCOMO）。
+
+> **進階本地推論（MLX 反思 / LLMLingua-2 壓縮）** 是另一組獨立 opt-in 功能，依賴的是 `mlx_lm`、`llmlingua` 這類 ML 套件，**而非** `duduclaw` 這個 PyPI 套件。需要時請依 `inference.toml` 個別安裝。
+
+若要安裝這個選用函式庫：
 
 ```bash
 pip install duduclaw
 ```
 
-此命令會安裝以下必要依賴：
+此命令會安裝以下依賴：
 
 | 套件 | 最低版本 | 用途 |
 |------|---------|------|
-| `anthropic` | ≥ 0.40 | Claude API 直接呼叫、Skill 安全掃描 |
+| `anthropic` | ≥ 0.40 | 在自有 Python 程式中直接呼叫 Claude API |
 | `httpx` | ≥ 0.27 | 非同步 HTTP 客戶端（帳號輪替、健康檢查）|
+| `pyyaml` | ≥ 6.0 | 設定檔解析 |
+
+#### macOS（Homebrew Python）／其他 externally-managed 環境
+
+系統若回報 `error: externally-managed-environment`（[PEP 668](https://peps.python.org/pep-0668/)），代表禁止直接裝進系統 Python。請改用虛擬環境：
+
+```bash
+# venv
+python3 -m venv .venv && source .venv/bin/activate
+pip install --upgrade duduclaw
+
+# 或使用 uv（本專案已採用，速度更快）
+uv venv && uv pip install --upgrade duduclaw
+```
+
+驗證安裝版本：
+
+```python
+import duduclaw
+print(duduclaw.__version__)   # 反映實際安裝的 PyPI 版本
+```
+
+> `__version__` 透過 `importlib.metadata` 從已安裝套件的 metadata（`pyproject.toml`）動態讀取，原始碼樹（未 pip 安裝）則回退到內建字串，並由 `scripts/release.sh` 的漂移守衛與其他平台版號一同同步。
 
 開發環境額外安裝：
 
@@ -442,8 +551,8 @@ pip install duduclaw[dev]
 git clone https://github.com/zhixuli0406/DuDuClaw.git
 cd DuDuClaw
 
-# 安裝 Python 依賴
-pip install duduclaw
+# （選用）僅在需要 import duduclaw 函式庫或記憶評測工具時安裝；核心建構不需要
+# pip install duduclaw
 
 # 建構 Dashboard
 cd web && npm ci --legacy-peer-deps && npm run build && cd ..
@@ -636,9 +745,9 @@ cd web && npx tsc --noEmit
 - [docs/spec/soul-md-spec.md](docs/spec/soul-md-spec.md) — SOUL.md 格式規範 v1.0
 - [docs/spec/contract-toml-spec.md](docs/spec/contract-toml-spec.md) — CONTRACT.toml 格式規範 v1.0
 - [docs/api/README.md](docs/api/README.md) — WebSocket RPC 協議 + JSON-RPC 2.0 介面
-- [docs/evolution-engine.md](docs/evolution-engine.md) — Evolution Engine v2 設計文件
-- [docs/deployment-guide.md](docs/deployment-guide.md) — 生產環境部署指南
-- [docs/development-guide.md](docs/development-guide.md) — 開發者設定與 Agent 開發
+- [docs/architecture/evolution-engine.md](docs/architecture/evolution-engine.md) — Evolution Engine v2 設計文件
+- [docs/guides/deployment-guide.md](docs/guides/deployment-guide.md) — 生產環境部署指南
+- [docs/guides/development-guide.md](docs/guides/development-guide.md) — 開發者設定與 Agent 開發
 - [docs/guides/custom-mcp-tool.md](docs/guides/custom-mcp-tool.md) — 自訂 MCP 工具教學
 
 ---

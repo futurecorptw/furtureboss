@@ -4,6 +4,8 @@ import { cn } from '@/lib/utils';
 import { api, type AccountInfo, type BudgetSummary } from '@/lib/api';
 import { toast, formatError } from '@/lib/toast';
 import { Dialog, FormField, inputClass, selectClass, buttonPrimary, buttonSecondary } from '@/components/shared/Dialog';
+import { ChipEditor } from '@/components/shared/ChipEditor';
+import { Page, PageHeader, Card, StatCard, Button, Badge, EmptyState } from '@/components/ui';
 import {
   Wallet,
   Plus,
@@ -13,6 +15,9 @@ import {
   Key,
   KeyRound,
   Pencil,
+  Settings2,
+  TrendingUp,
+  PiggyBank,
 } from 'lucide-react';
 
 export function AccountsPage() {
@@ -52,58 +57,48 @@ export function AccountsPage() {
     totalBudget > 0 ? Math.min(100, (totalSpent / totalBudget) * 100) : 0;
 
   return (
-    <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <h2 className="text-2xl font-semibold text-stone-900 dark:text-stone-50">
-          {intl.formatMessage({ id: 'accounts.title' })}
-        </h2>
-        <div className="flex gap-2">
-          <button
-            onClick={handleRotate}
-            className="inline-flex items-center gap-2 rounded-lg border border-stone-200 bg-white px-4 py-2 text-sm font-medium text-stone-700 transition-colors hover:bg-stone-50 dark:border-stone-700 dark:bg-stone-800 dark:text-stone-300 dark:hover:bg-stone-700"
-          >
-            <RefreshCw className="h-4 w-4" />
-            {intl.formatMessage({ id: 'accounts.rotate' })}
-          </button>
-          <button
-            onClick={() => setShowAddDialog(true)}
-            className="inline-flex items-center gap-2 rounded-lg bg-amber-500 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-amber-600"
-          >
-            <Plus className="h-4 w-4" />
-            {intl.formatMessage({ id: 'accounts.add' })}
-          </button>
-        </div>
+    <Page>
+      <PageHeader
+        icon={Wallet}
+        title={intl.formatMessage({ id: 'nav.accounts' })}
+        subtitle={intl.formatMessage({ id: 'accounts.title' })}
+        actions={
+          <>
+            <Button variant="secondary" icon={RefreshCw} onClick={handleRotate}>
+              {intl.formatMessage({ id: 'accounts.rotate' })}
+            </Button>
+            <Button variant="primary" icon={Plus} onClick={() => setShowAddDialog(true)}>
+              {intl.formatMessage({ id: 'accounts.add' })}
+            </Button>
+          </>
+        }
+      />
+
+      {/* Budget Summary KPIs */}
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+        <StatCard
+          icon={TrendingUp}
+          tone="warning"
+          label={intl.formatMessage({ id: 'accounts.budget.used' })}
+          value={`$${(totalSpent / 100).toFixed(2)}`}
+        />
+        <StatCard
+          icon={PiggyBank}
+          tone="success"
+          label={intl.formatMessage({ id: 'accounts.budget.remaining' })}
+          value={`$${((totalBudget - totalSpent) / 100).toFixed(2)}`}
+        />
+        <StatCard
+          icon={Wallet}
+          tone="accent"
+          label={intl.formatMessage({ id: 'accounts.budget.total' })}
+          value={`$${(totalBudget / 100).toFixed(2)}`}
+        />
       </div>
 
-      {/* Budget Summary */}
-      <div className="glass-card rounded-2xl p-6">
-        <div className="flex items-center gap-3 mb-4">
-          <div className="rounded-lg bg-amber-100 p-2.5 dark:bg-amber-900/30">
-            <Wallet className="h-5 w-5 text-amber-600 dark:text-amber-400" />
-          </div>
-          <div>
-            <h3 className="text-lg font-medium text-stone-900 dark:text-stone-50">
-              {intl.formatMessage({ id: 'accounts.budget.total' })}
-            </h3>
-          </div>
-        </div>
-
-        <div className="mb-2 flex justify-between text-sm">
-          <span className="text-stone-500 dark:text-stone-400">
-            {intl.formatMessage({ id: 'accounts.budget.used' })}:{' '}
-            <span className="font-semibold text-stone-900 dark:text-stone-50">
-              ${(totalSpent / 100).toFixed(2)}
-            </span>
-          </span>
-          <span className="text-stone-500 dark:text-stone-400">
-            {intl.formatMessage({ id: 'accounts.budget.remaining' })}:{' '}
-            <span className="font-semibold text-stone-900 dark:text-stone-50">
-              ${((totalBudget - totalSpent) / 100).toFixed(2)}
-            </span>
-          </span>
-        </div>
-
-        <div className="h-3 overflow-hidden rounded-full bg-stone-200 dark:bg-stone-700">
+      {/* Budget Summary progress */}
+      <Card title={intl.formatMessage({ id: 'accounts.budget.total' })}>
+        <div className="h-3 overflow-hidden rounded-full bg-stone-500/15 dark:bg-white/10">
           <div
             className={cn(
               'h-full rounded-full transition-all',
@@ -116,12 +111,13 @@ export function AccountsPage() {
             style={{ width: `${usagePercent}%` }}
           />
         </div>
-
-        <p className="mt-2 text-right text-xs text-stone-400 dark:text-stone-500">
-          ${(totalBudget / 100).toFixed(2)}{' '}
-          {intl.formatMessage({ id: 'accounts.budget.total' })}
+        <p className="mt-2 flex justify-between text-xs text-stone-500 dark:text-stone-400">
+          <span className="tabular-nums">
+            ${(totalSpent / 100).toFixed(2)} / ${(totalBudget / 100).toFixed(2)}
+          </span>
+          <span className="tabular-nums">{usagePercent.toFixed(0)}%</span>
         </p>
-      </div>
+      </Card>
 
       {/* Accounts List */}
       {!loading && budget?.accounts && budget.accounts.length > 0 ? (
@@ -131,12 +127,12 @@ export function AccountsPage() {
           ))}
         </div>
       ) : !loading ? (
-        <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-stone-300 bg-white py-16 dark:border-stone-700 dark:bg-stone-900">
-          <Wallet className="mb-4 h-12 w-12 text-stone-300 dark:text-stone-600" />
-          <p className="text-stone-500 dark:text-stone-400">
-            {intl.formatMessage({ id: 'common.noData' })}
-          </p>
-        </div>
+        <Card>
+          <EmptyState
+            icon={Wallet}
+            title={intl.formatMessage({ id: 'common.noData' })}
+          />
+        </Card>
       ) : null}
 
       {/* Add Account Dialog */}
@@ -145,7 +141,7 @@ export function AccountsPage() {
         onClose={() => setShowAddDialog(false)}
         onCreated={fetchBudget}
       />
-    </div>
+    </Page>
   );
 }
 
@@ -280,6 +276,7 @@ function AccountCard({
   onBudgetUpdated: () => void;
 }) {
   const [editing, setEditing] = useState(false);
+  const [showDetails, setShowDetails] = useState(false);
   const [budgetInput, setBudgetInput] = useState(String(account.monthly_budget_cents / 100));
   const [saving, setSaving] = useState(false);
 
@@ -302,10 +299,10 @@ function AccountCard({
   };
 
   return (
-    <div className="glass-card glass-card-hover rounded-2xl p-5">
+    <div className="panel p-5">
       <div className="flex items-start justify-between">
         <div className="flex items-center gap-3">
-          <div className="rounded-lg bg-stone-100 p-2 dark:bg-stone-800">
+          <div className="rounded-lg bg-stone-500/10 p-2 dark:bg-white/5">
             {(account.auth_method ?? 'unknown') === 'apikey' ? (
               <Key className="h-4 w-4 text-stone-600 dark:text-stone-400" />
             ) : (
@@ -319,16 +316,37 @@ function AccountCard({
             </p>
           </div>
         </div>
-        {account.is_healthy ? (
-          <CheckCircle className="h-5 w-5 text-emerald-500" />
-        ) : (
-          <AlertTriangle className="h-5 w-5 text-amber-500" />
-        )}
+        <div className="flex items-center gap-2">
+          <Button
+            variant="ghost"
+            size="sm"
+            icon={Settings2}
+            onClick={() => setShowDetails(true)}
+            title={intl.formatMessage({ id: 'accounts.edit' })}
+            aria-label={intl.formatMessage({ id: 'accounts.edit' })}
+          />
+          {account.is_healthy ? (
+            <Badge tone="success" dot>
+              <CheckCircle className="h-3.5 w-3.5" />
+            </Badge>
+          ) : (
+            <Badge tone="warning" dot>
+              <AlertTriangle className="h-3.5 w-3.5" />
+            </Badge>
+          )}
+        </div>
       </div>
+
+      <EditAccountDialog
+        account={account}
+        open={showDetails}
+        onClose={() => setShowDetails(false)}
+        onSaved={() => { setShowDetails(false); onBudgetUpdated(); }}
+      />
 
       <div className="mt-3 flex items-center gap-2 text-xs text-stone-500 dark:text-stone-400">
         <span>
-          {intl.formatMessage({ id: 'accounts.priority' })}: <strong>{account.priority}</strong>
+          {intl.formatMessage({ id: 'accounts.priority' })}: <strong className="tabular-nums">{account.priority}</strong>
         </span>
       </div>
 
@@ -337,28 +355,28 @@ function AccountCard({
           <span>{intl.formatMessage({ id: 'accounts.budget.used' })}</span>
           {editing ? (
             <div className="flex items-center gap-1">
-              <span>${(account.spent_this_month / 100).toFixed(2)} / $</span>
+              <span className="tabular-nums">${(account.spent_this_month / 100).toFixed(2)} / $</span>
               <input
                 type="number"
                 min="1"
                 value={budgetInput}
                 onChange={(e) => setBudgetInput(e.target.value)}
-                className="w-20 rounded border border-amber-400 bg-white px-1.5 py-0.5 text-xs text-stone-900 focus:outline-none dark:border-amber-600 dark:bg-stone-800 dark:text-stone-50"
+                className="w-20 rounded-lg border border-amber-400 bg-[var(--panel-fill)] px-1.5 py-0.5 text-xs tabular-nums text-stone-900 focus:outline-none dark:border-amber-600 dark:text-stone-50"
                 autoFocus
               />
-              <button onClick={handleSaveBudget} disabled={saving} className="rounded bg-amber-500 px-1.5 py-0.5 text-xs text-white hover:bg-amber-600 disabled:opacity-50">
+              <Button size="sm" variant="primary" onClick={handleSaveBudget} disabled={saving}>
                 {intl.formatMessage({ id: 'common.save' })}
-              </button>
-              <button onClick={() => setEditing(false)} className="text-xs text-stone-400 hover:text-stone-600">
+              </Button>
+              <Button size="sm" variant="ghost" onClick={() => setEditing(false)}>
                 {intl.formatMessage({ id: 'common.cancel' })}
-              </button>
+              </Button>
             </div>
           ) : (
             <button
               onClick={() => { setBudgetInput(String(account.monthly_budget_cents / 100)); setEditing(true); }}
               className="flex items-center gap-1 hover:text-amber-600 dark:hover:text-amber-400"
             >
-              <span>
+              <span className="tabular-nums">
                 ${(account.spent_this_month / 100).toFixed(2)} / $
                 {(account.monthly_budget_cents / 100).toFixed(2)}
               </span>
@@ -366,7 +384,7 @@ function AccountCard({
             </button>
           )}
         </div>
-        <div className="h-1.5 overflow-hidden rounded-full bg-stone-200 dark:bg-stone-700">
+        <div className="h-1.5 overflow-hidden rounded-full bg-stone-500/15 dark:bg-white/10">
           <div
             className={cn(
               'h-full rounded-full transition-all',
@@ -377,5 +395,105 @@ function AccountCard({
         </div>
       </div>
     </div>
+  );
+}
+
+// ── G.5 — full per-account edit (priority/tags/profile/email/subscription/label) ──
+
+function EditAccountDialog({
+  account,
+  open,
+  onClose,
+  onSaved,
+}: {
+  account: AccountInfo;
+  open: boolean;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const intl = useIntl();
+  const [priority, setPriority] = useState(String(account.priority ?? 1));
+  const [label, setLabel] = useState(account.label ?? '');
+  const [email, setEmail] = useState(account.email ?? '');
+  const [subscription, setSubscription] = useState(account.subscription ?? '');
+  const [profile, setProfile] = useState('');
+  const [tags, setTags] = useState<string[]>([]);
+  const [budget, setBudget] = useState(String((account.monthly_budget_cents ?? 0) / 100));
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // Reset form whenever a different account opens.
+  useEffect(() => {
+    if (open) {
+      setPriority(String(account.priority ?? 1));
+      setLabel(account.label ?? '');
+      setEmail(account.email ?? '');
+      setSubscription(account.subscription ?? '');
+      setProfile('');
+      setTags([]);
+      setBudget(String((account.monthly_budget_cents ?? 0) / 100));
+      setError(null);
+    }
+  }, [open, account]);
+
+  const handleSubmit = async () => {
+    setSaving(true);
+    setError(null);
+    try {
+      await api.accounts.update({
+        account_id: account.id,
+        priority: Number(priority),
+        label,
+        email,
+        subscription,
+        ...(profile.trim() !== '' ? { profile: profile.trim() } : {}),
+        ...(tags.length > 0 ? { tags } : {}),
+        monthly_budget_cents: Math.round(Number(budget) * 100),
+      });
+      onSaved();
+    } catch (e) {
+      setError(formatError(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Dialog open={open} onClose={onClose} title={`${intl.formatMessage({ id: 'accounts.edit' })} — ${account.id}`}>
+      <div className="space-y-4">
+        <div className="grid grid-cols-2 gap-3">
+          <FormField label={intl.formatMessage({ id: 'accounts.provider.priority' })}>
+            <input type="number" min={1} max={100} value={priority} onChange={(e) => setPriority(e.target.value)} className={inputClass} />
+          </FormField>
+          <FormField label={intl.formatMessage({ id: 'accounts.provider.budget' })}>
+            <input type="number" min={0} value={budget} onChange={(e) => setBudget(e.target.value)} className={inputClass} />
+          </FormField>
+        </div>
+        <FormField label={intl.formatMessage({ id: 'accounts.field.label' })}>
+          <input type="text" value={label} onChange={(e) => setLabel(e.target.value)} className={inputClass} />
+        </FormField>
+        <div className="grid grid-cols-2 gap-3">
+          <FormField label={intl.formatMessage({ id: 'accounts.field.email' })}>
+            <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} className={inputClass} />
+          </FormField>
+          <FormField label={intl.formatMessage({ id: 'accounts.field.subscription' })}>
+            <input type="text" value={subscription} onChange={(e) => setSubscription(e.target.value)} placeholder="pro / max / team" className={inputClass} />
+          </FormField>
+        </div>
+        <FormField label={intl.formatMessage({ id: 'accounts.field.profile' })} hint={intl.formatMessage({ id: 'accounts.field.profile.hint' })}>
+          <input type="text" value={profile} onChange={(e) => setProfile(e.target.value)} className={inputClass} />
+        </FormField>
+        <FormField label={intl.formatMessage({ id: 'accounts.field.tags' })}>
+          <ChipEditor values={tags} onChange={setTags} placeholder="prod" addLabel={intl.formatMessage({ id: 'common.add' })} />
+        </FormField>
+        {error && <p className="text-sm text-rose-600 dark:text-rose-400">{error}</p>}
+        <div className="flex justify-end gap-3 pt-2">
+          <button onClick={onClose} className={buttonSecondary}>{intl.formatMessage({ id: 'common.cancel' })}</button>
+          <button onClick={handleSubmit} disabled={saving} className={buttonPrimary}>
+            {saving ? intl.formatMessage({ id: 'common.saving' }) : intl.formatMessage({ id: 'common.save' })}
+          </button>
+        </div>
+      </div>
+    </Dialog>
   );
 }
