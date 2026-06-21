@@ -53,7 +53,7 @@ export function McpPage() {
   const connState = useConnectionStore((s) => s.state);
   const { agentConfigs, catalog, loading, fetchAll, oauthProviders, fetchOAuthProviders } = useMcpStore();
   const { agents, fetchAgents } = useAgentsStore();
-  const [activeTab, setActiveTab] = useState<Tab>('agents');
+  const [activeTab, setActiveTab] = useState<Tab>('oauth');
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
   const [showAddDialog, setShowAddDialog] = useState(false);
   const [catalogFilter, setCatalogFilter] = useState<string | null>(null);
@@ -132,9 +132,9 @@ export function McpPage() {
   const isInstalled = (catalogId: string) =>
     agentConfigs.some((cfg) => Object.keys(cfg.servers).includes(catalogId));
 
+  // FutureBoss 客製：整合服務頁只保留 OAuth（連 Google 等服務的入口）。
+  // Agent / Marketplace 分頁隱藏（下方 render 區塊保留但不會觸發）。
   const tabItems: TabItem[] = [
-    { id: 'agents', label: intl.formatMessage({ id: 'mcp.tab.agents' }) },
-    { id: 'marketplace', label: intl.formatMessage({ id: 'mcp.tab.marketplace' }) },
     { id: 'oauth', label: intl.formatMessage({ id: 'mcp.tab.oauth' }) },
   ];
 
@@ -144,11 +144,6 @@ export function McpPage() {
         icon={Plug}
         title={intl.formatMessage({ id: 'nav.mcp' })}
         subtitle={intl.formatMessage({ id: 'mcp.title' })}
-        actions={
-          <Button variant="primary" icon={Plus} onClick={() => setShowAddDialog(true)}>
-            {intl.formatMessage({ id: 'mcp.add' })}
-          </Button>
-        }
       />
 
       {/* Toast */}
@@ -174,8 +169,10 @@ export function McpPage() {
         </div>
       )}
 
-      {/* Tabs */}
-      <Tabs items={tabItems} value={activeTab} onChange={(id) => setActiveTab(id as Tab)} />
+      {/* Tabs — FutureBoss 客製：只剩 OAuth 一個分頁時不顯示 tab bar */}
+      {tabItems.length > 1 && (
+        <Tabs items={tabItems} value={activeTab} onChange={(id) => setActiveTab(id as Tab)} />
+      )}
 
       {loading && (
         <div className="flex items-center justify-center py-12">

@@ -1,6 +1,6 @@
 # FutureBoss
 
-**Version 2.0.0**
+**Version 2.0.1**
 
 FutureBoss 是一套「單人專屬」的 AI Agent 控制台 —— 你的 AI 數位分身。提供精簡、溫暖的儀表板介面，整合 Telegram 等通道、排程提醒、記憶與知識庫，讓 AI 助理像貼身特助一樣為你工作。
 
@@ -79,6 +79,9 @@ cargo build --release -p duduclaw-cli --bin duduclaw
 ---
 
 ## 更新紀錄
+
+### v2.0.1
+- 「整合服務」頁（`/mcp`）只保留 **OAuth 認證**分頁（連 Google 等服務的入口）；隱藏 Agent 設定 / Marketplace 分頁與「新增 MCP Server」按鈕。
 
 ### v2.0.0
 - **大型升級：底層 fork 從上游 DuDuClaw v1.20.0 rebase 到 v1.22.1**，併入上游近期所有功能。
